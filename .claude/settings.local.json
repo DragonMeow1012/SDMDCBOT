@@ -1,7 +1,41 @@
 {
   "permissions": {
     "allow": [
-      "Bash(\"d:/vsc/DCbot_1.0/data/.gitkeep\")"
+      "Bash(\"d:/vsc/DCbot_1.0/data/.gitkeep\")",
+      "Bash(pip show:*)",
+      "Bash(python -m pip show discord.py google-generativeai python-dotenv requests beautifulsoup4)",
+      "Bash(py -3 --version)",
+      "Bash(where python3:*)",
+      "Bash(where python:*)",
+      "Read(//usr/**)",
+      "Bash(python3 -m pip show discord.py google-generativeai python-dotenv)",
+      "Read(//c/Users/DragonMeow/AppData/Local/Programs/**)",
+      "Bash(ls /c/Python*)",
+      "Read(//c/Users/DragonMeow//**)",
+      "Bash(cmd.exe /c \"where python 2>&1\")",
+      "Bash(python3 -m pip install -r requirements.txt)",
+      "Bash(winget --version)",
+      "Bash(choco --version)",
+      "Bash(scoop --version)",
+      "Bash(winget install:*)",
+      "Bash(export PATH=\"$PATH:/c/Users/DragonMeow/AppData/Local/Programs/Python/Python312:/c/Users/DragonMeow/AppData/Local/Programs/Python/Python312/Scripts\")",
+      "Bash(python3.12 --version)",
+      "Bash(PYTHON=\"/c/Users/DragonMeow/AppData/Local/Programs/Python/Python312/python.exe\")",
+      "Bash(\"$PYTHON\" --version)",
+      "Bash(\"$PYTHON\" -m pip install -r requirements.txt)",
+      "Bash(timeout 8 \"$PYTHON\" main.py)",
+      "Bash(\"$PYTHON\" -m pip install google-genai)",
+      "Bash(\"/c/Users/DragonMeow/AppData/Local/Programs/Python/Python312/python.exe\" -m pip install google-genai)",
+      "Bash(\"/c/Users/DragonMeow/AppData/Local/Programs/Python/Python312/python.exe\" -m pip show google-genai)",
+      "Bash(timeout 10 \"/c/Users/DragonMeow/AppData/Local/Programs/Python/Python312/python.exe\" main.py)",
+      "Bash(kill 1446)",
+      "Bash(kill 1475)",
+      "Bash(pkill -f main.py)",
+      "Bash(kill 747 753 760)",
+      "Bash(cmd.exe /c 'setx PATH \"\"%PATH%;C:\\\\Users\\\\DragonMeow\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312;C:\\\\Users\\\\DragonMeow\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\Scripts\"\" 2>&1')",
+      "Bash(cmd.exe /c \"python --version 2>&1\")",
+      "Bash(powershell.exe -Command \"[Environment]::SetEnvironmentVariable\\(''Path'', [Environment]::GetEnvironmentVariable\\(''Path'',''User''\\) + '';C:\\\\Users\\\\DragonMeow\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312;C:\\\\Users\\\\DragonMeow\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\Scripts'', ''User''\\); Write-Output ''Done''\")",
+      "Bash(powershell.exe -Command \"[Environment]::GetEnvironmentVariable\\(''''Path'''',''''User''''\\)\")"
     ]
   }
 }

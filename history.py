@@ -69,12 +69,12 @@ def save_history(chat_sessions: dict) -> None:
         for cid, sess in chat_sessions.items():
             chat_obj = sess.get('chat_obj')
             if chat_obj is not None and hasattr(chat_obj, 'history'):
+                # 新 SDK 的 parts 序列化為 {"text": "..."} 格式
                 hist = [
-                    {"role": m.role, "parts": [p.text for p in m.parts]}
+                    {"role": m.role, "parts": [{"text": p.text} for p in m.parts]}
                     for m in chat_obj.history
                 ]
             else:
-                # 尚未初始化或模型切換前，保留原始歷史
                 hist = sess.get('raw_history', [])
 
             data[str(cid)] = {

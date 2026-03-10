@@ -30,6 +30,7 @@ API_DELAY = 5.0  # 每次 API 請求之間的最短間隔（秒）
 # --- 本地資料儲存 ---
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 HISTORY_FILE = os.path.join(DATA_DIR, "chat_history.json")
+NICKNAMES_FILE = os.path.join(DATA_DIR, "nicknames.json")
 
 # --- AI 個性設定 ---
 PERSONALITY = {
