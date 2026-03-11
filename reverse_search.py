@@ -8,11 +8,15 @@ from config import SAUCENAO_API_KEY
 
 _SAUCENAO_URL = 'https://saucenao.com/search.php'
 _HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
 }
 
 
-async def reverse_image_search(image_data: bytes, mime_type: str) -> str:
+async def reverse_image_search(
+    image_data: bytes,
+    mime_type: str,
+    image_url: str = '',
+) -> str:
     """
     以圖搜圖，回傳格式化的來源清單（最多 3 筆）或錯誤訊息。
     """
@@ -42,11 +46,8 @@ async def reverse_image_search(image_data: bytes, mime_type: str) -> str:
             sim = float(hdr.get('similarity', 0))
             if sim < 60:
                 continue
-            title = (dat.get('title')
-                     or dat.get('source')
-                     or dat.get('creator')
-                     or dat.get('material')
-                     or '未知')
+            title = (dat.get('title') or dat.get('source')
+                     or dat.get('creator') or dat.get('material') or '未知')
             urls = hdr.get('ext_urls', [])
             url = urls[0] if urls else '（無連結）'
             lines.append(f'相似度 {sim:.0f}%：{title}\n{url}')
