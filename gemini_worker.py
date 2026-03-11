@@ -8,6 +8,7 @@ from google.genai import types
 
 from config import GEMINI_API_KEYS, GEMINI_MODEL_NAME, PERSONALITY, API_DELAY
 from history import save_history
+from knowledge import add_entry
 
 # --- API Key 輪替 ---
 _key_index: int = 0
@@ -109,6 +110,7 @@ async def gemini_worker(chat_sessions: dict) -> None:
         prompt: str = req['prompt_text']
         file_parts: list[dict] = req.get('file_parts', [])
         msg = req['message_object']
+        kb_save: dict | None = req.get('kb_save')
 
         try:
             sess = chat_sessions.get(cid)
@@ -149,6 +151,20 @@ async def gemini_worker(chat_sessions: dict) -> None:
                                 await msg.channel.send(text[i:i + 1990])
                         else:
                             await msg.reply(text)
+
+                        # 自動將圖片分析結果儲存至知識庫
+                        if kb_save:
+                            try:
+                                entry = add_entry(
+                                    kb_save['entries'],
+                                    f"[圖片分析 {kb_save['label']}]: {text[:800]}",
+                                    kb_save['saved_by'],
+                                )
+                                await msg.channel.send(
+                                    f"📌 圖片分析已自動儲存至知識庫 `#{entry['id']}`，之後可以直接問我喵！"
+                                )
+                            except Exception as e:
+                                print(f"[KB] 自動儲存圖片分析失敗: {e}")
 
                         save_history(chat_sessions)
                         break  # 成功，結束重試迴圈

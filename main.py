@@ -28,7 +28,7 @@ from nicknames import (
     build_all_nicknames_summary,
 )
 from knowledge import (
-    load_knowledge, add_entry, remove_entry, build_knowledge_context,
+    load_knowledge, add_entry, remove_entry, search_entries, build_knowledge_context,
 )
 from reverse_search import reverse_image_search
 from summary import load_summary
@@ -104,8 +104,12 @@ async def slash_kb_add(interaction: discord.Interaction,
     await interaction.response.send_message(f'已儲存至知識庫 `#{entry["id"]}`！', ephemeral=True)
 
 
-@kb_group.command(name="load", description="將知識庫內容注入此頻道對話供模型參考")
+@kb_group.command(name="load", description="從磁碟重新載入知識庫並注入此頻道對話供模型參考")
 async def slash_kb_load(interaction: discord.Interaction):
+    global knowledge_entries
+    # 從磁碟重載，確保包含最新圖片分析與手動新增的條目
+    knowledge_entries = load_knowledge()
+
     cid = interaction.channel_id
     sess = chat_sessions.get(cid)
     if not sess or not sess.get('chat_obj'):
@@ -119,7 +123,9 @@ async def slash_kb_load(interaction: discord.Interaction):
     chat = sess['chat_obj']
     await asyncio.to_thread(chat.send_message, kb_ctx)
     save_history(chat_sessions)
-    await interaction.followup.send('✅ 知識庫已注入此頻道對話！', ephemeral=True)
+    await interaction.followup.send(
+        f'✅ 知識庫已重新載入並注入此頻道對話！（共 {len(knowledge_entries)} 筆）', ephemeral=True
+    )
 
 
 async def _apply_gag(target: discord.Member, duration: int) -> str | None:
@@ -431,13 +437,30 @@ async def on_message(msg: discord.Message) -> None:
     elif web_ctx := chat_sessions[cid].get('current_web_context'):
         prompt = f'根據我之前讀取的內容：\n```\n{web_ctx}\n```\n請問：{prompt}'
 
-    final_prompt = identity_prefix + prompt
+    # 自動注入知識庫（讓模型永遠能看到 KB 內容）
+    kb_ctx = build_knowledge_context(knowledge_entries)
+    final_prompt = (kb_ctx + identity_prefix + prompt) if kb_ctx else (identity_prefix + prompt)
+
+    # 有圖片附件且非搜圖查詢時，回應後自動存入 KB
+    has_image = any(fp['mime_type'].startswith('image/') for fp in file_parts)
+    kb_save = None
+    if has_image and not _is_source_query(prompt):
+        img_filename = next(
+            (a.filename for a in msg.attachments if (a.content_type or '').startswith('image/')),
+            'image'
+        )
+        kb_save = {
+            'entries': knowledge_entries,
+            'saved_by': msg.author.id,
+            'label': img_filename,
+        }
 
     await msg_queue.put({
         'channel_id': cid,
         'prompt_text': final_prompt,
         'file_parts': file_parts,
         'message_object': msg,
+        'kb_save': kb_save,
     })
 
 
