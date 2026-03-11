@@ -6,6 +6,7 @@
 import os
 import json
 from config import DATA_DIR, HISTORY_FILE
+from summary import save_summary
 
 
 def _ensure_data_dir() -> None:
@@ -68,11 +69,12 @@ def save_history(chat_sessions: dict) -> None:
         data: dict = {}
         for cid, sess in chat_sessions.items():
             chat_obj = sess.get('chat_obj')
-            if chat_obj is not None and hasattr(chat_obj, 'history'):
-                # 新 SDK 的 parts 序列化為 {"text": "..."} 格式
+            if chat_obj is not None and hasattr(chat_obj, 'get_history'):
+                # 新 SDK 使用 get_history() 方法（無 .history 屬性）
+                # image/blob parts 的 p.text 為 None，以 "[附件]" 替代
                 hist = [
-                    {"role": m.role, "parts": [{"text": p.text} for p in m.parts]}
-                    for m in chat_obj.history
+                    {"role": m.role, "parts": [{"text": p.text if p.text else "[附件]"} for p in m.parts]}
+                    for m in chat_obj.get_history()
                 ]
             else:
                 hist = sess.get('raw_history', [])
@@ -84,6 +86,10 @@ def save_history(chat_sessions: dict) -> None:
 
         with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+
+        # 同步更新各頻道的可讀 TXT 摘要
+        for cid_str, sess_data in data.items():
+            save_summary(int(cid_str), sess_data.get('raw_history', []))
 
         print(f"✅ 歷史已存: {HISTORY_FILE}")
 
