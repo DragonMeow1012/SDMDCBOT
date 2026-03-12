@@ -29,7 +29,7 @@ if not GEMINI_API_KEYS:
 # --- Gemini 模型 ---
 GEMINI_MODEL_NAME = "gemini-2.5-flash"
 API_DELAY = 5.0          # 每次 API 請求之間的最短間隔（秒）
-HISTORY_MAX_TURNS = 300  # 每頻道儲存的最大歷史訊息筆數（超出時刪除最舊的）
+HISTORY_MAX_TURNS = 150  # 每頻道儲存的最大歷史訊息筆數（超出時刪除最舊的）
 
 # --- 以圖搜圖（選填，有則提升 SauceNAO 配額至 200次/天）---
 SAUCENAO_API_KEY: str = os.getenv('SAUCENAO_API_KEY', '')
