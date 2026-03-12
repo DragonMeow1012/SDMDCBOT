@@ -47,7 +47,14 @@
       "Bash(wc -l /d/vsc/DCbot_1.0/*.py)",
       "Bash(taskkill /F /IM python.exe)",
       "Bash(cmd /c \"taskkill /F /IM python.exe\")",
-      "Bash(cmd /c \"taskkill /F /IM python.exe && echo killed\")"
+      "Bash(cmd /c \"taskkill /F /IM python.exe && echo killed\")",
+      "Bash(kill 552)",
+      "Bash(kill 1859)",
+      "Bash(xargs kill:*)",
+      "Bash(cmd.exe /c \"taskkill /F /IM python.exe\")",
+      "Bash(cmd.exe /c \"tasklist | findstr python\")",
+      "Bash(kill 949)",
+      "Bash(kill 974)"
     ]
   }
 }

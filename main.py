@@ -410,7 +410,7 @@ async def on_message(msg: discord.Message) -> None:
     if nick:
         user_ctx = f'[User ID: {msg.author.id}, 暱稱: {nick}]'
     else:
-        user_ctx = f'[User ID: {msg.author.id}, 伺服器名稱: {display_name}（未設定自訂暱稱，請以此名稱稱呼對方）]'
+        user_ctx = f'[User ID: {msg.author.id}, 伺服器名稱: {display_name}]'
 
     if is_master:
         nick_summary = build_all_nicknames_summary(nicknames)

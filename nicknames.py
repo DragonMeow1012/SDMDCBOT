@@ -58,7 +58,7 @@ def build_user_context(user_id: int, nicknames: dict[str, str]) -> str:
     格式：[User ID: {id}, 暱稱: {nick}]  或  [User ID: {id}, 暱稱: 未知]
     """
     nick = get_nickname(user_id, nicknames)
-    nick_part = f', 暱稱: {nick}' if nick else ', 暱稱: 未知（請詢問對方暱稱）'
+    nick_part = f', 暱稱: {nick}' if nick else ''
     return f'[User ID: {user_id}{nick_part}]'
 
 

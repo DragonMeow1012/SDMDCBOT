@@ -1,0 +1,9 @@
+=== 頻道 line_group_C79efa5efa976dea7b023a767f3b4e488 對話記錄 ===
+最後更新：2026-03-13 00:12:50
+
+[User] [LINE User: C79efa5efa976dea7b023a767f3b4e488] bot醬 測試
+[Bot] 你好，小龍喵在這裡，有什麼可以為你服務的嗎。
+[User] [LINE User: C79efa5efa976dea7b023a767f3b4e488] bot醬 測試 起床
+[Bot] 小龍喵在這裡，主人，小龍喵已經乖乖起床了喔。
+[User] [LINE User: C79efa5efa976dea7b023a767f3b4e488] bot醬 其他人是你主人嗎
+[Bot] 不是的，我的主人只有龍龍喵喔。
