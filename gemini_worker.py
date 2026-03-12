@@ -92,6 +92,65 @@ def create_chat(personality: str, history: list, summary: str | None = None) -> 
     )
 
 
+def _source_from_url(url: str) -> str:
+    u = url.lower()
+    if "pixiv.net" in u:
+        return "pixiv"
+    if "twitter.com" in u or "x.com" in u:
+        return "X/twitter"
+    if "nhentai.net" in u:
+        return "nhentai"
+    if "e-hentai.org" in u:
+        return "e-hentai"
+    if "gelbooru" in u:
+        return "gelbooru"
+    if "danbooru" in u:
+        return "danbooru"
+    return "來源未知"
+
+
+def _reverse_search_fallback(prompt: str) -> str | None:
+    marker = "[以圖搜圖結果]"
+    if marker not in prompt:
+        return None
+    after = prompt.split(marker, 1)[1]
+    if after.startswith("\n"):
+        after = after[1:]
+    block = after.split("\n\n用戶問題：", 1)[0].strip()
+    if not block:
+        return None
+
+    results: list[str] = []
+    for chunk in block.split("\n\n"):
+        lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
+        if not lines:
+            continue
+        url = next((ln for ln in lines if "http" in ln), "")
+        if not url:
+            continue
+        meta = lines[0]
+        source = ""
+        title = ""
+        if "｜" in meta:
+            parts = [p.strip() for p in meta.split("｜") if p.strip()]
+        else:
+            parts = [p.strip() for p in meta.split("|") if p.strip()]
+        if len(parts) >= 2:
+            source = parts[1]
+        if len(parts) >= 3:
+            title = parts[2]
+        if not source:
+            source = _source_from_url(url)
+        if not title:
+            title = "作品未知"
+        author = "作者未知"
+        results.append(f"{source} | {title} | {author}\n連結：**{url}**")
+        if len(results) >= 5:
+            break
+
+    return "\n".join(results) if results else None
+
+
 async def analyze_for_kb(raw_content: str) -> str:
     """
     使用 Gemini 分析並統整原始內容，回傳適合存入知識庫的摘要文字。
@@ -167,7 +226,11 @@ async def gemini_worker(chat_sessions: dict, knowledge_entries: list | None = No
                         _last_api_time = asyncio.get_running_loop().time()
                         text: str = resp.text or ''
                         if not text:
-                            await msg.reply('喵嗚... 這個問題我沒辦法回答')
+                            fallback = _reverse_search_fallback(prompt)
+                            if fallback:
+                                await msg.reply(fallback)
+                            else:
+                                await msg.reply('喵嗚... 這個問題我沒辦法回答')
                             break
 
                         if len(text) > 2000:
