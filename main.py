@@ -76,6 +76,37 @@ async def slash_nick(interaction: discord.Interaction, 暱稱: str, 對象: disc
         await interaction.response.send_message(f'已將 {target.mention} 的暱稱設為「{暱稱}」。', ephemeral=True)
 
 
+@tree.command(name="清除記憶", description="清除所有頻道的聊天記憶（主人限定）")
+async def slash_clear_memory(interaction: discord.Interaction):
+    if interaction.user.id != MASTER_ID:
+        await interaction.response.send_message('此指令限主人使用喵！', ephemeral=True)
+        return
+
+    chat_sessions.clear()
+    import json as _json
+    from config import HISTORY_FILE
+    with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+        _json.dump({}, f)
+    await interaction.response.send_message('✅ 所有頻道的聊天記憶已清除！', ephemeral=True)
+    print('[RESET] 主人清除了所有聊天記憶。')
+
+
+@tree.command(name="清空知識庫", description="清空所有知識庫內容（主人限定）")
+async def slash_clear_kb(interaction: discord.Interaction):
+    global knowledge_entries
+    if interaction.user.id != MASTER_ID:
+        await interaction.response.send_message('此指令限主人使用喵！', ephemeral=True)
+        return
+
+    knowledge_entries.clear()
+    import json as _json
+    from knowledge import KNOWLEDGE_FILE
+    with open(KNOWLEDGE_FILE, 'w', encoding='utf-8') as f:
+        _json.dump([], f)
+    await interaction.response.send_message('✅ 知識庫已清空！', ephemeral=True)
+    print('[RESET] 主人清空了知識庫。')
+
+
 # ---------------------------------------------------------------------------
 # /kb 指令群組（新增 / 載入知識庫）
 # ---------------------------------------------------------------------------

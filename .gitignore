@@ -3,3 +3,4 @@ data/chat_history.json
 data/bot.log
 __pycache__/
 *.pyc
+data/*

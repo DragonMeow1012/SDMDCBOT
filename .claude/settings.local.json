@@ -54,7 +54,11 @@
       "Bash(cmd.exe /c \"taskkill /F /IM python.exe\")",
       "Bash(cmd.exe /c \"tasklist | findstr python\")",
       "Bash(kill 949)",
-      "Bash(kill 974)"
+      "Bash(kill 974)",
+      "Bash(kill 641)",
+      "Bash(pkill -f \"python main.py\")",
+      "Bash(kill 1265)",
+      "Bash(kill 481)"
     ]
   }
 }
