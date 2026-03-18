@@ -207,6 +207,32 @@ async def slash_quote(interaction: discord.Interaction, 文字: str, 用戶: dis
         view=view)
 
 
+@tree.context_menu(name="名言佳句")
+async def ctx_quote(interaction: discord.Interaction, message: discord.Message):
+    """右鍵訊息 → Apps → 名言佳句，直接以該訊息內容生圖。"""
+    from quote_image import make_quote_image
+    import io
+
+    text = message.content.strip()
+    if not text:
+        await interaction.response.send_message('這則訊息沒有文字內容喵！', ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    target = message.author
+    avatar_url = target.display_avatar.replace(size=512).url
+    nick = nicknames.get(str(target.id)) or (target.display_name if isinstance(target, discord.Member) else target.name)
+
+    img_bytes = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: make_quote_image(avatar_url, text, nick, target.id))
+
+    view = QuoteToggleView(avatar_url, text, nick, target.id, grayscale=True)
+    await interaction.followup.send(
+        file=discord.File(io.BytesIO(img_bytes), filename='quote.png'),
+        view=view)
+
+
 @tree.command(name="電子氣泡紙", description="發送一片可點擊的電子氣泡紙，每格「啵」都是獨立的防雷標籤，點一下啵一下！")
 @app_commands.describe(尺寸="氣泡紙大小")
 @app_commands.choices(尺寸=[
