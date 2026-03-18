@@ -57,7 +57,7 @@ _worker_started: bool = False
 # ---------------------------------------------------------------------------
 # 全域斜線指令
 # ---------------------------------------------------------------------------
-@tree.command(name="nick", description="設定暱稱（預設為自己；主人可指定對象）")
+@tree.command(name="nick", description="設定你的暱稱，模型會優先用暱稱稱呼你。主人可指定對象。")
 @app_commands.describe(暱稱="要設定的暱稱", 對象="目標成員（主人限定，預設為自己）")
 async def slash_nick(interaction: discord.Interaction, 暱稱: str, 對象: discord.Member = None):
     is_master = (interaction.user.id == MASTER_ID)
@@ -76,7 +76,7 @@ async def slash_nick(interaction: discord.Interaction, 暱稱: str, 對象: disc
         await interaction.response.send_message(f'已將 {target.mention} 的暱稱設為「{暱稱}」。', ephemeral=True)
 
 
-@tree.command(name="清除記憶", description="清除所有頻道的聊天記憶（主人限定）")
+@tree.command(name="清除記憶", description="清除所有頻道的聊天歷史，下次對話將重新開始。（主人限定）")
 async def slash_clear_memory(interaction: discord.Interaction):
     if interaction.user.id != MASTER_ID:
         await interaction.response.send_message('此指令限主人使用喵！', ephemeral=True)
@@ -91,7 +91,7 @@ async def slash_clear_memory(interaction: discord.Interaction):
     print('[RESET] 主人清除了所有聊天記憶。')
 
 
-@tree.command(name="清空知識庫", description="清空所有知識庫內容（主人限定）")
+@tree.command(name="清空知識庫", description="清空所有永久知識庫條目，無法復原。（主人限定）")
 async def slash_clear_kb(interaction: discord.Interaction):
     global knowledge_entries
     if interaction.user.id != MASTER_ID:
@@ -105,6 +105,516 @@ async def slash_clear_kb(interaction: discord.Interaction):
         _json.dump([], f)
     await interaction.response.send_message('✅ 知識庫已清空！', ephemeral=True)
     print('[RESET] 主人清空了知識庫。')
+
+
+class RouletteView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+        self.participants: list[discord.Member] = []
+        self.closed = False
+
+    @discord.ui.button(label='參加輪盤 🎰', style=discord.ButtonStyle.danger)
+    async def join(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if self.closed:
+            await interaction.response.send_message('報名已結束！', ephemeral=True)
+            return
+        if any(m.id == interaction.user.id for m in self.participants):
+            await interaction.response.send_message('你已經報名了喵！', ephemeral=True)
+            return
+        self.participants.append(interaction.user)
+        await interaction.response.send_message(
+            f'✅ {interaction.user.mention} 已報名！目前 {len(self.participants)} 人參加。',
+            ephemeral=False)
+
+    async def on_timeout(self):
+        self.closed = True
+        self.stop()
+
+
+@tree.command(name="口球輪盤", description="開啟口球輪盤！1分鐘報名，時間到從參加者隨機抽一人禁言 30 秒💀")
+async def slash_roulette(interaction: discord.Interaction):
+    view = RouletteView()
+    await interaction.response.send_message(
+        '🎰 **口球輪盤開始！**\n1分鐘內點下方按鈕報名，時間到將從參加者中隨機抽出一人戴上電子口球 30 秒！💀',
+        view=view)
+
+    await asyncio.sleep(60)
+    view.closed = True
+
+    if not view.participants:
+        await interaction.edit_original_response(
+            content='🎰 **口球輪盤結束**\n...沒有人報名，輪盤空轉了喵。', view=None)
+        return
+
+    import random
+    victim = random.choice(view.participants)
+    mentions = '、'.join(m.mention for m in view.participants)
+
+    err = await _apply_gag(victim, 30)
+    if err:
+        await interaction.edit_original_response(
+            content=f'🎰 **輪盤結束！** 參加者：{mentions}\n抽中了 {victim.mention}，但是... {err}', view=None)
+    else:
+        await interaction.edit_original_response(
+            content=f'🎰 **輪盤結束！** 參加者：{mentions}\n💀 恭喜 {victim.mention} 獲得電子口球 30 秒！', view=None)
+
+
+class QuoteToggleView(discord.ui.View):
+    def __init__(self, avatar_url: str, quote: str, author_name: str, author_id: int, grayscale: bool = True):
+        super().__init__(timeout=120)
+        self.avatar_url = avatar_url
+        self.quote = quote
+        self.author_name = author_name
+        self.author_id = author_id
+        self.grayscale = grayscale
+        self._update_label()
+
+    def _update_label(self):
+        self.toggle_btn.label = '切換彩色 🎨' if self.grayscale else '切換黑白 ⬛'
+
+    @discord.ui.button(label='切換彩色 🎨', style=discord.ButtonStyle.secondary)
+    async def toggle_btn(self, interaction: discord.Interaction, _btn: discord.ui.Button):
+        from quote_image import make_quote_image
+        import io
+        self.grayscale = not self.grayscale
+        self._update_label()
+        await interaction.response.defer()
+        img_bytes = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: make_quote_image(
+                self.avatar_url, self.quote, self.author_name, self.author_id, grayscale=self.grayscale))
+        await interaction.edit_original_response(
+            attachments=[discord.File(io.BytesIO(img_bytes), filename='quote.png')],
+            view=self)
+
+
+@tree.command(name="名言佳句", description="輸入一段話，生成帶有用戶頭像的名言佳句圖片，支援黑白/彩色切換。")
+@app_commands.describe(文字="名言內容", 用戶="頭像主角（預設為自己）")
+async def slash_quote(interaction: discord.Interaction, 文字: str, 用戶: discord.Member = None):
+    from quote_image import make_quote_image
+    import io
+    await interaction.response.defer()
+
+    target = 用戶 or interaction.user
+    avatar_url = target.display_avatar.replace(size=512).url
+    nick = nicknames.get(str(target.id)) or target.display_name
+
+    img_bytes = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: make_quote_image(avatar_url, 文字, nick, target.id))
+
+    view = QuoteToggleView(avatar_url, 文字, nick, target.id, grayscale=True)
+    await interaction.followup.send(
+        file=discord.File(io.BytesIO(img_bytes), filename='quote.png'),
+        view=view)
+
+
+@tree.command(name="電子氣泡紙", description="發送一片可點擊的電子氣泡紙，每格「啵」都是獨立的防雷標籤，點一下啵一下！")
+@app_commands.describe(尺寸="氣泡紙大小")
+@app_commands.choices(尺寸=[
+    app_commands.Choice(name="2×5（10顆）",  value="2x5"),
+    app_commands.Choice(name="5×10（50顆）", value="5x10"),
+])
+async def slash_bubblewrap(interaction: discord.Interaction, 尺寸: str = "2x5"):
+    cols, rows = (2, 5) if 尺寸 == "2x5" else (5, 10)
+    grid = '\n'.join(' '.join('||啵||' for _ in range(cols)) for _ in range(rows))
+    await interaction.response.send_message(f'🫧 **電子氣泡紙 {cols}×{rows}**\n{grid}')
+
+
+# ---------------------------------------------------------------------------
+# /電子木魚
+# ---------------------------------------------------------------------------
+_MERIT_FILE = os.path.join('data', 'merit.json')
+
+
+def _load_merit() -> dict:
+    if os.path.exists(_MERIT_FILE):
+        import json as _j
+        with open(_MERIT_FILE, encoding='utf-8') as f:
+            return _j.load(f)
+    return {}
+
+
+def _save_merit(data: dict) -> None:
+    import json as _j
+    with open(_MERIT_FILE, 'w', encoding='utf-8') as f:
+        _j.dump(data, f, ensure_ascii=False, indent=2)
+
+
+class MeritView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.session_count = 0
+
+    @discord.ui.button(label='🪘 功德+1', style=discord.ButtonStyle.success, custom_id='merit_btn')
+    async def merit_btn(self, interaction: discord.Interaction, _btn: discord.ui.Button):
+        uid = str(interaction.user.id)
+        data = _load_merit()
+        data[uid] = data.get(uid, 0) + 1
+        _save_merit(data)
+        self.session_count += 1
+        nick = nicknames.get(uid) or interaction.user.display_name
+        await interaction.response.edit_message(
+            content=f'🪘 **電子木魚**\n'
+                    f'本次功德：**{self.session_count}** 下\n'
+                    f'（{nick} 累計功德：**{data[uid]}** 下）')
+
+
+@tree.command(name="電子木魚", description="發送一個電子木魚，按下按鈕敲木魚，每次積累一點功德🪘")
+async def slash_merit(interaction: discord.Interaction):
+    view = MeritView()
+    await interaction.response.send_message('🪘 **電子木魚**\n本次功德：**0** 下', view=view)
+
+
+@tree.command(name="電子木魚功德排行榜", description="查看本伺服器敲木魚功德累積次數 TOP10 排行榜")
+async def slash_merit_rank(interaction: discord.Interaction):
+    data = _load_merit()
+    if not data:
+        await interaction.response.send_message('還沒有人積過功德喵！', ephemeral=True)
+        return
+    sorted_data = sorted(data.items(), key=lambda x: x[1], reverse=True)
+    lines = ['🪘 **功德排行榜 TOP10**']
+    guild = interaction.guild
+    for i, (uid, cnt) in enumerate(sorted_data[:10], 1):
+        member = guild.get_member(int(uid)) if guild else None
+        name = nicknames.get(uid) or (member.display_name if member else f'用戶{uid}')
+        lines.append(f'`{i}.` {name} — **{cnt}** 下')
+    await interaction.response.send_message('\n'.join(lines))
+
+
+# ---------------------------------------------------------------------------
+# /認養寵物 / /認主人 / /本群關係圖
+# ---------------------------------------------------------------------------
+_REL_FILE = os.path.join('data', 'relationships.json')
+
+
+def _load_rel() -> dict:
+    if os.path.exists(_REL_FILE):
+        import json as _j
+        with open(_REL_FILE, encoding='utf-8') as f:
+            return _j.load(f)
+    return {}
+
+
+def _save_rel(data: dict) -> None:
+    import json as _j
+    with open(_REL_FILE, 'w', encoding='utf-8') as f:
+        _j.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _get_name(guild: discord.Guild, uid: str) -> str:
+    member = guild.get_member(int(uid))
+    return nicknames.get(uid) or (member.display_name if member else f'用戶{uid}')
+
+
+class RelationView(discord.ui.View):
+    """通用認養/認主人確認按鈕。mode: 'pet'=認養寵物, 'master'=認主人"""
+    def __init__(self, requester: discord.Member, target: discord.Member,
+                 guild_id: int, mode: str):
+        super().__init__(timeout=60)
+        self.requester = requester
+        self.target    = target
+        self.guild_id  = guild_id
+        self.mode      = mode  # 'pet' or 'master'
+
+    @discord.ui.button(label='接受 ✅', style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, _btn: discord.ui.Button):
+        if interaction.user.id != self.target.id:
+            await interaction.response.send_message('這不是你的確認按鈕喵！', ephemeral=True)
+            return
+
+        data   = _load_rel()
+        gid    = str(self.guild_id)
+        req_id = str(self.requester.id)
+        tgt_id = str(self.target.id)
+        if gid not in data:
+            data[gid] = {}
+
+        if self.mode == 'pet':
+            # requester 認養 target 為寵物 → target 的 master = requester
+            data[gid][tgt_id] = req_id
+            msg = f'🐾 {self.target.mention} 成為了 {self.requester.mention} 的寵物！'
+        else:
+            # requester 認 target 為主人 → requester 的 master = target
+            data[gid][req_id] = tgt_id
+            msg = f'🐾 {self.requester.mention} 成為了 {self.target.mention} 的寵物！'
+
+        _save_rel(data)
+        await interaction.response.edit_message(content=msg, view=None)
+        self.stop()
+
+    @discord.ui.button(label='拒絕 ❌', style=discord.ButtonStyle.secondary)
+    async def deny(self, interaction: discord.Interaction, _btn: discord.ui.Button):
+        if interaction.user.id != self.target.id:
+            await interaction.response.send_message('這不是你的確認按鈕喵！', ephemeral=True)
+            return
+        await interaction.response.edit_message(content='❌ 對方拒絕了喵。', view=None)
+        self.stop()
+
+
+@tree.command(name="認養寵物", description="邀請指定用戶成為你的寵物，對方同意後建立主寵關係🐾")
+@app_commands.describe(用戶="要認養的對象")
+async def slash_adopt(interaction: discord.Interaction, 用戶: discord.Member):
+    if 用戶.id == interaction.user.id:
+        await interaction.response.send_message('不能認養自己喵！', ephemeral=True)
+        return
+    if 用戶.bot:
+        await interaction.response.send_message('不能認養 Bot 喵！', ephemeral=True)
+        return
+    req_name = nicknames.get(str(interaction.user.id)) or interaction.user.display_name
+    view = RelationView(interaction.user, 用戶, interaction.guild_id, mode='pet')
+    await interaction.response.send_message(
+        f'{用戶.mention}，{interaction.user.mention}（{req_name}）想認養你為寵物，你願意嗎？🐾',
+        view=view)
+
+
+@tree.command(name="認主人", description="邀請指定用戶成為你的主人，對方同意後建立主寵關係🐾")
+@app_commands.describe(用戶="要認作主人的對象")
+async def slash_find_master(interaction: discord.Interaction, 用戶: discord.Member):
+    if 用戶.id == interaction.user.id:
+        await interaction.response.send_message('不能認自己為主人喵！', ephemeral=True)
+        return
+    if 用戶.bot:
+        await interaction.response.send_message('不能認 Bot 為主人喵！', ephemeral=True)
+        return
+    req_name = nicknames.get(str(interaction.user.id)) or interaction.user.display_name
+    view = RelationView(interaction.user, 用戶, interaction.guild_id, mode='master')
+    await interaction.response.send_message(
+        f'{用戶.mention}，{interaction.user.mention}（{req_name}）想認你為主人，你願意嗎？🐾',
+        view=view)
+
+
+@tree.command(name="本群關係圖", description="以樹狀圖顯示本伺服器所有用戶的主人與寵物關係🐾👑")
+async def slash_rel_map(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message('此指令只能在伺服器中使用！', ephemeral=True)
+        return
+
+    data = _load_rel()
+    gid  = str(guild.id)
+    rels = data.get(gid, {})
+    if not rels:
+        await interaction.response.send_message('本群還沒有任何主寵關係喵！', ephemeral=True)
+        return
+
+    # 建立 master -> [pets] 對應
+    master_map: dict[str, list[str]] = {}
+    for pet_id, master_id in rels.items():
+        master_map.setdefault(master_id, []).append(pet_id)
+
+    # 找出所有沒有主人的主人（根節點）
+    lines = ['🐾 **本群主寵關係圖**']
+    visited = set()
+
+    def build_tree(uid: str, depth: int):
+        indent = '　' * depth
+        name = _get_name(guild, uid)
+        tag = '👑' if uid in master_map else '🐾'
+        lines.append(f'{indent}{tag} {name}')
+        visited.add(uid)
+        for pet in master_map.get(uid, []):
+            if pet not in visited:
+                build_tree(pet, depth + 1)
+
+    roots = [m for m in master_map if m not in rels]
+    for root in roots:
+        build_tree(root, 0)
+
+    # 孤立寵物（主人不在伺服器或無樹根）
+    orphans = [p for p in rels if p not in visited]
+    if orphans:
+        lines.append('\n**— 其他關係 —**')
+        for pet_id in orphans:
+            master_id = rels[pet_id]
+            lines.append(f'🐾 {_get_name(guild, pet_id)} → 主人：{_get_name(guild, master_id)}')
+
+    await interaction.response.send_message('\n'.join(lines))
+
+
+class FishingView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label='咬鉤 🪝', style=discord.ButtonStyle.danger)
+    async def bite(self, interaction: discord.Interaction, _btn: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        channel = interaction.channel
+        user = interaction.user
+
+        # 取得或建立 Webhook
+        try:
+            hooks = await channel.webhooks()
+            wh = next((h for h in hooks if h.name == '賽博釣魚'), None)
+            if wh is None:
+                wh = await channel.create_webhook(name='賽博釣魚')
+        except discord.Forbidden:
+            await interaction.followup.send('Bot 缺少管理 Webhook 的權限喵！', ephemeral=True)
+            return
+
+        avatar_url = user.display_avatar.replace(size=256).url
+        display_name = nicknames.get(str(user.id)) or user.display_name
+
+        await wh.send('我是小男娘', username=display_name, avatar_url=avatar_url)
+        await interaction.followup.send('🎣 上鉤了！', ephemeral=True)
+
+
+@tree.command(name="賽博釣群友", description="放出釣魚按鈕，點下「咬鉤」的人會被 Webhook 偽裝發出一則訊息🪝")
+async def slash_fishing(interaction: discord.Interaction):
+    view = FishingView()
+    await interaction.response.send_message(
+        '🎣 **賽博釣魚中...**\n有人敢點嗎？', view=view)
+
+
+_COIN_DRAMA = [
+    '硬幣拋向了空中...',
+    '一陣風吹過，硬幣飛得更高了...',
+    '硬幣突破了對流層...',
+    '硬幣衝出了大氣層...',
+    '硬幣撞到了馬斯克的衛星，彈了回來...',
+    '硬幣路過月球，嚇到了一隻兔子...',
+    '硬幣被外星人短暫研究後歸還...',
+    '硬幣開始自轉，產生了引力場...',
+    '硬幣被小龍喵一把抓住，然後又吐了出來...',
+    '硬幣懸浮在空中，陷入了哲學思考...',
+    '薛丁格的貓路過，硬幣暫時同時是正面和反面...',
+    '硬幣被一隻鴿子叼走，又被另一隻鴿子搶走...',
+    '硬幣飛過了某個平行宇宙，裡面的你沒有丟硬幣...',
+    '硬幣不小心進入了量子疊加態，工程師正在除錯...',
+    '硬幣路過 7-11，買了一瓶茶飲料...',
+    '硬幣被誤認為是隕石，NASA 發了一篇論文...',
+    '硬幣決定先去旅遊，訂了張機票...',
+    '硬幣在空中停了一下，拍了張自拍...',
+    '硬幣終於開始下落了...（好像）',
+    '一隻手從天而降，接住了硬幣，然後鬆開了...',
+]
+
+
+@tree.command(name="擲硬幣", description="擲一枚硬幣，隨機出現正面或反面🪙")
+async def slash_coin(interaction: discord.Interaction):
+    import random
+    result = random.choice(['🌕 正面', '🌑 反面'])
+    await interaction.response.send_message(f'🪙 擲出結果：**{result}**！')
+
+
+@tree.command(name="擲硬幣幹話版", description="擲硬幣幹話版，硬幣先歷經奇妙旅程，隨機 1~5 句後才揭曉正反面🪙")
+async def slash_coin_drama(interaction: discord.Interaction):
+    import random
+    result = random.choice(['🌕 **正面**', '🌑 **反面**'])
+    lines = random.sample(_COIN_DRAMA, random.randint(1, 5))
+
+    await interaction.response.send_message(f'🪙 {lines[0]}')
+    for line in lines[1:]:
+        await asyncio.sleep(random.uniform(1.2, 2.2))
+        await interaction.channel.send(line)
+
+    await asyncio.sleep(random.uniform(1.2, 2.0))
+    await interaction.channel.send(f'硬幣落地！結果是⋯⋯ {result}！')
+
+
+@tree.command(name="賽博體重計", description="隨機量測你的賽博體重，體重過重有機率觸發特殊反應⚖️")
+async def slash_weight(interaction: discord.Interaction):
+    import random
+    weight = random.randint(10, 150)
+    msg = f'⚖️ 賽博體重計顯示：**{weight} kg**'
+    if weight > 100 and random.random() < 0.05:
+        msg += '\n天啊你是柚子廚'
+    await interaction.response.send_message(msg)
+
+
+# ---------------------------------------------------------------------------
+# /炮決蘿莉控
+# ---------------------------------------------------------------------------
+_ARTILLERY_FILE = os.path.join('data', 'artillery_records.json')
+_ARTILLERY_IMG  = os.path.join('data', 'picture', 'artillerylolicon.jpg')
+
+
+def _load_artillery() -> dict:
+    if os.path.exists(_ARTILLERY_FILE):
+        with open(_ARTILLERY_FILE, encoding='utf-8') as f:
+            import json as _j
+            return _j.load(f)
+    return {}
+
+
+def _save_artillery(data: dict) -> None:
+    import json as _j
+    with open(_ARTILLERY_FILE, 'w', encoding='utf-8') as f:
+        _j.dump(data, f, ensure_ascii=False, indent=2)
+
+
+@tree.command(name="炮決蘿莉控", description="從頻道成員隨機或指定一人炮決💀，並記錄累計被炮決次數")
+@app_commands.describe(用戶="指定炮決對象（不填則隨機）")
+async def slash_artillery(interaction: discord.Interaction, 用戶: discord.Member = None):
+    channel = interaction.channel
+    guild   = interaction.guild
+    if guild is None:
+        await interaction.response.send_message('此指令只能在伺服器中使用！', ephemeral=True)
+        return
+
+    if 用戶 is not None:
+        victim = 用戶
+    else:
+        members = [m for m in guild.members if not m.bot and channel.permissions_for(m).read_messages]
+        if not members:
+            await interaction.response.send_message('找不到可炮決的對象喵...', ephemeral=True)
+            return
+        import random
+        victim = random.choice(members)
+
+    uid = str(victim.id)
+    gid = str(guild.id)
+
+    # 更新記錄
+    records = _load_artillery()
+    if gid not in records:
+        records[gid] = {}
+    records[gid][uid] = records[gid].get(uid, 0) + 1
+    count = records[gid][uid]
+    _save_artillery(records)
+
+    nick = nicknames.get(uid) or victim.display_name
+
+    await interaction.response.send_message(
+        f'今天炮決的是 {victim.mention}（{nick}）💀\n'
+        f'（累計被炮決 **{count}** 次）',
+        file=discord.File(_ARTILLERY_IMG))
+
+
+@tree.command(name="炮決排行", description="查看本伺服器被炮決次數 TOP10 排行榜💀")
+async def slash_artillery_rank(interaction: discord.Interaction):
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message('此指令只能在伺服器中使用！', ephemeral=True)
+        return
+
+    records = _load_artillery()
+    gid = str(guild.id)
+    if gid not in records or not records[gid]:
+        await interaction.response.send_message('還沒有人被炮決過喵！', ephemeral=True)
+        return
+
+    sorted_records = sorted(records[gid].items(), key=lambda x: x[1], reverse=True)
+    lines = ['💀 **炮決排行榜** 💀']
+    for i, (uid, cnt) in enumerate(sorted_records[:10], 1):
+        member = guild.get_member(int(uid))
+        name = (nicknames.get(uid) or member.display_name) if member else f'（已離開 {uid}）'
+        lines.append(f'`{i}.` {name} — **{cnt}** 次')
+
+    await interaction.response.send_message('\n'.join(lines))
+
+
+@tree.command(name="清除炮決名單", description="清除本伺服器的所有炮決記錄，無法復原。（主人限定）")
+async def slash_artillery_clear(interaction: discord.Interaction):
+    if interaction.user.id != MASTER_ID:
+        await interaction.response.send_message('此指令限主人使用喵！', ephemeral=True)
+        return
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message('此指令只能在伺服器中使用！', ephemeral=True)
+        return
+    records = _load_artillery()
+    records.pop(str(guild.id), None)
+    _save_artillery(records)
+    await interaction.response.send_message('✅ 本伺服器的炮決名單已清除！', ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +756,7 @@ class GagConfirmView(discord.ui.View):
         self.stop()
 
 
-@tree.command(name="電子口球", description="對成員套用全伺服器禁言（Timeout）")
+@tree.command(name="電子口球", description="對成員套用全伺服器禁言（Timeout）。主人可直接執行，對他人需對方確認🔇")
 @app_commands.describe(time="持續秒數", who="目標（預設為自己）")
 async def slash_gag(interaction: discord.Interaction,
                     time: int,

@@ -6,3 +6,4 @@ beautifulsoup4>=4.12.0
 cloudscraper>=1.2.71
 playwright>=1.40.0
 line-bot-sdk>=3.0.0
+Pillow>=10.0.0
