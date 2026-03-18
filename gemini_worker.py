@@ -3,6 +3,7 @@ Gemini API 工作器模組（使用新版 google-genai SDK）。
 負責：Client 初始化、API Key 輪替、請求佇列限速處理。
 """
 import asyncio
+import re
 from google import genai
 from google.genai import types
 
@@ -227,6 +228,8 @@ async def gemini_worker(chat_sessions: dict, knowledge_entries: list | None = No
                         resp = await asyncio.to_thread(chat.send_message, content)
                         _last_api_time = asyncio.get_running_loop().time()
                         text: str = resp.text or ''
+                        # 將模型輸出的 @數字ID 轉為 Discord mention 格式 <@ID>
+                        text = re.sub(r'@(\d{15,20})', r'<@\1>', text)
                         if not text:
                             fallback = _reverse_search_fallback(prompt)
                             if fallback:

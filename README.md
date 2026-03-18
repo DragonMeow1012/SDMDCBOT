@@ -1,21 +1,22 @@
 # 小龍喵 Discord Bot
 
-基於 Gemini AI 的 Discord / LINE 聊天機器人，支援多角色人格、暱稱系統、知識庫、網頁抓取、對話記憶跨重啟保留。
+基於 Gemini AI 的 Discord / LINE 聊天機器人，支援多角色人格、暱稱系統、知識庫、網頁抓取、圖片反搜、對話記憶跨重啟保留。
 
 ---
 
 ## 功能
 
-- **AI 對話**：使用 Gemini 2.5 Flash 模型，@提及即可對話
+- **AI 對話**：使用 Gemini 2.5 Flash，@提及即可對話
 - **雙人格模式**：主人（龍龍喵）與一般訪客使用不同人格設定
-- **對話記憶**：聊天歷史儲存在本地 `data/chat_history.json`，重啟後自動載入
-- **對話摘要**：自動將歷史序列化為 TXT（`data/summaries/`），供模型跨 session 參考
-- **暱稱系統**：每位用戶可設定自訂暱稱，模型優先使用暱稱稱呼對方
-- **知識庫**：可儲存跨頻道永久知識條目，支援文字或檔案上傳後 AI 分析
-- **網頁抓取**：訊息中附上 URL 會自動抓取內容並摘要或回答問題
-- **圖片反搜**：附圖訊息自動觸發反向圖片搜尋
+- **對話記憶**：歷史儲存於 `data/chat_history.json`，重啟自動載入
+- **對話摘要**：自動序列化為 TXT（`data/summaries/`），供模型跨 session 參考
+- **暱稱系統**：每位用戶可設定暱稱，模型優先用暱稱稱呼
+- **知識庫**：永久儲存跨頻道知識條目，支援文字或檔案 AI 分析
+- **網頁抓取**：訊息附上 URL 自動抓取並摘要或回答問題
+- **圖片反搜**：`/以圖搜圖` 或關鍵字觸發反向圖片搜尋
+- **名言佳句**：右鍵訊息生成 1920×1080 精美引言圖
 - **LINE 整合**：支援 LINE Bot Webhook，LINE 聊天也能與 Gemini 對話
-- **電子口球**：主人可對成員套用全伺服器禁言（Timeout）
+- **電子口球**：對成員套用全伺服器禁言（Timeout）
 - **API Key 輪替**：支援最多 4 組 Gemini API Key，超出限制自動切換
 
 ---
@@ -24,28 +25,46 @@
 
 ```
 DCbot_1.0/
-├── main.py            # Discord 事件入口（on_ready、on_message）、斜線指令
-├── config.py          # 環境變數、PERSONALITY 人格設定、常數
-├── gemini_worker.py   # Gemini API Worker、模型初始化、Key 輪替
-├── history.py         # 本地聊天歷史讀寫
-├── nicknames.py       # 暱稱系統（load/save/build context）
-├── knowledge.py       # 知識庫（data/knowledge.json）
-├── summary.py         # 對話摘要序列化（data/summaries/）
-├── web.py             # 網頁抓取（requests + BeautifulSoup）
-├── line_bot.py        # LINE Bot Webhook 伺服器（port 8080）
-├── reverse_search.py  # 圖片反向搜尋
+├── main.py               # 入口：Discord 事件、session 管理、URL/附件處理
+├── state.py              # 共享可變狀態（chat_sessions / nicknames / knowledge_entries）
+├── config.py             # 環境變數、PERSONALITY 人格設定、常數
+├── gemini_worker.py      # Gemini API Worker、模型初始化、Key 輪替
+├── history.py            # 本地聊天歷史讀寫（data/chat_history.json）
+├── nicknames.py          # 暱稱系統（load/save/build context）
+├── knowledge.py          # 知識庫（data/knowledge.json）
+├── summary.py            # 對話摘要序列化（data/summaries/）
+├── web.py                # 網頁抓取（requests + BeautifulSoup）
+├── line_bot.py           # LINE Bot Webhook 伺服器（port 8080）
+├── reverse_search.py     # 圖片反向搜尋（SauceNAO + soutubot）
+├── quote_image.py        # 名言佳句圖片生成（Pillow，1920×1080）
+├── commands/             # 斜線指令套件
+│   ├── __init__.py       # setup_all(tree) 統一注冊
+│   ├── admin.py          # /清除記憶、/清空知識庫
+│   ├── nick.py           # /nick
+│   ├── gag.py            # /電子口球、/口球輪盤
+│   ├── fun.py            # /電子氣泡紙、/電子木魚、/電子木魚功德排行榜
+│   │                     # /賽博體重計、/擲硬幣、/擲硬幣幹話版
+│   ├── social.py         # /認養寵物、/認主人、/本群關係圖、/賽博釣群友
+│   ├── artillery.py      # /炮決蘿莉控、/炮決排行、/清除炮決名單
+│   ├── quote.py          # 右鍵選單：名言佳句、Make it Quote
+│   ├── search.py         # /以圖搜圖
+│   └── kb.py             # /kb 群組（add/remove/list/load）、!kb 文字指令
 ├── data/
-│   ├── chat_history.json    # 自動生成，儲存各頻道對話歷史
-│   ├── nicknames.json       # 自動生成，儲存用戶暱稱
-│   ├── knowledge.json       # 自動生成，儲存知識庫條目
-│   ├── summaries/           # 各頻道對話摘要 TXT
-│   └── bot.log              # 執行時 log（背景啟動時產生）
-├── .env               # 金鑰設定（不提交 git）
-├── .env.example       # 金鑰範本
-├── requirements.txt   # Python 依賴套件
-├── Dockerfile         # Docker 映像
-├── docker-compose.yml # Docker Compose 設定
-└── dc1.py             # 原始 Colab 版本（已棄用）
+│   ├── chat_history.json      # 各頻道對話歷史（自動生成）
+│   ├── nicknames.json         # 用戶暱稱（自動生成）
+│   ├── knowledge.json         # 知識庫條目（自動生成）
+│   ├── merit.json             # 電子木魚功德記錄（自動生成）
+│   ├── relationships.json     # 主寵關係（自動生成）
+│   ├── artillery_records.json # 炮決記錄（自動生成）
+│   ├── summaries/             # 各頻道對話摘要 TXT
+│   ├── picture/
+│   │   └── artillerylolicon.jpg
+│   └── bot.log                # 執行 log（背景啟動時產生）
+├── .env                  # 金鑰設定（不提交 git）
+├── .env.example          # 金鑰範本
+├── requirements.txt      # Python 依賴套件
+├── Dockerfile
+└── docker-compose.yml
 ```
 
 ---
@@ -62,11 +81,10 @@ winget install Python.Python.3.12
 
 ```bash
 pip install -r requirements.txt
+playwright install chromium
 ```
 
 ### 3. 設定金鑰
-
-複製範本並填入真實金鑰：
 
 ```bash
 copy .env.example .env
@@ -102,8 +120,6 @@ python main.py
 
 ### 背景執行（持續運行）
 
-啟動並將 log 寫入 `data/bot.log`：
-
 ```bash
 python main.py > data/bot.log 2>&1 &
 ```
@@ -120,21 +136,17 @@ python main.py > data/bot.log 2>&1 &
 tail -20 data/bot.log
 ```
 
-查詢目前 Bot 的 PID：
+查詢 Bot PID：
 
 ```bash
 ps aux | grep "main.py" | grep -v grep
 ```
 
-關閉 Bot（指定 PID）：
+關閉 Bot：
 
 ```bash
 kill <PID>
-```
-
-關閉 Bot（全部）：
-
-```bash
+# 或全部關閉
 pkill -f "main.py"
 ```
 
@@ -161,24 +173,69 @@ docker compose up -d
 | `@小龍喵 你好` | 一般對話 |
 | `@小龍喵 https://example.com` | 抓取網頁並摘要 |
 | `@小龍喵 https://example.com 這篇說什麼？` | 抓取後依問題回答 |
-| 附圖 + `@小龍喵` | 自動觸發圖片反向搜尋 |
+| 附圖 + `@小龍喵` | 圖片分析並自動存入知識庫 |
+| 附圖 + `@小龍喵 來源？` | 自動觸發反向圖片搜尋 |
 
 ---
 
 ## 斜線指令
 
+### AI 與記憶
+
 | 指令 | 說明 | 權限 |
 |------|------|------|
-| `/nick 暱稱` | 設定自己的暱稱 | 所有人 |
+| `/nick 暱稱` | 設定自己的暱稱（模型稱呼用） | 所有人 |
 | `/nick 暱稱 對象` | 設定指定成員的暱稱 | 主人限定 |
-| `/kb add 文字` | 新增文字到知識庫 | 所有人 |
-| `/kb add 檔案` | 上傳檔案並由 AI 分析後儲存 | 所有人 |
-| `/kb remove 節次` | 刪除知識庫指定節次 | 主人限定 |
-| `/kb list` | 列出知識庫所有節次 | 主人限定 |
-| `/kb load` | 重新載入知識庫並注入當前頻道 | 所有人 |
-| `/電子口球 成員 時長` | 對成員套用 Timeout 禁言 | 主人限定 |
 | `/清除記憶` | 清除所有頻道的聊天記憶 | 主人限定 |
-| `/清空知識庫` | 清空所有知識庫內容 | 主人限定 |
+
+### 知識庫
+
+| 指令 | 說明 | 權限 |
+|------|------|------|
+| `/kb add 文字` | 新增文字到知識庫 | 所有人 |
+| `/kb add 檔案` | 上傳檔案由 AI 分析後儲存 | 所有人 |
+| `/kb remove 節次` | 刪除指定節次 | 主人限定 |
+| `/kb list` | 列出所有節次 | 主人限定 |
+| `/kb load` | 重新載入並注入當前頻道 | 所有人 |
+| `/清空知識庫` | 清空所有知識庫條目 | 主人限定 |
+
+### 搜尋與圖片
+
+| 指令 | 說明 | 權限 |
+|------|------|------|
+| `/以圖搜圖 圖片` | 用截圖找來源（pixiv/twitter/x/nh） | 所有人 |
+| 右鍵 → `名言佳句` | 將訊息製成名言圖（1920×1080） | 所有人 |
+| 右鍵 → `Make it Quote` | 同上（英文選單） | 所有人 |
+
+### 娛樂
+
+| 指令 | 說明 | 權限 |
+|------|------|------|
+| `/擲硬幣` | 擲一枚硬幣，正面或反面 | 所有人 |
+| `/擲硬幣幹話版` | 硬幣先歷經奇妙旅程，1~10 句後揭曉結果 | 所有人 |
+| `/電子氣泡紙 尺寸` | 發送可點擊的電子氣泡紙（5×2 / 10×5） | 所有人 |
+| `/電子木魚` | 敲木魚積功德按鈕 | 所有人 |
+| `/電子木魚功德排行榜` | 功德 TOP10 排行榜 | 所有人 |
+| `/賽博體重計` | 量測賽博體重 | 所有人 |
+| `/炮決蘿莉控 [用戶]` | 隨機或指定炮決，並記錄次數💀 | 所有人 |
+| `/炮決排行` | 被炮決次數 TOP10 | 所有人 |
+| `/清除炮決名單` | 清除本伺服器炮決記錄 | 主人限定 |
+
+### 社交
+
+| 指令 | 說明 | 權限 |
+|------|------|------|
+| `/認養寵物 用戶` | 邀請對方成為你的寵物🐾 | 所有人 |
+| `/認主人 用戶` | 邀請對方成為你的主人🐾 | 所有人 |
+| `/本群關係圖` | 樹狀顯示本伺服器主寵關係 | 所有人 |
+| `/賽博釣群友` | 放出釣魚按鈕，咬鉤者會被偽裝發言🪝 | 所有人 |
+
+### 管理
+
+| 指令 | 說明 | 權限 |
+|------|------|------|
+| `/電子口球 time [who]` | 對成員套用 Timeout 禁言🔇 | 主人直接執行，對他人需確認 |
+| `/口球輪盤` | 1分鐘報名，隨機抽一人禁言 30 秒💀 | 所有人 |
 
 ---
 
@@ -197,4 +254,5 @@ docker compose up -d
 - `.env` 包含敏感金鑰，請勿提交至 git（已加入 `.gitignore`）
 - `data/chat_history.json` 儲存對話記錄，請定期備份
 - Bot 需在 Discord Developer Portal 開啟 **Message Content Intent**
-- LINE Bot 需在 LINE Developers Console 設定 Webhook URL 為 `https://<your-domain>:8080/webhook`
+- LINE Bot 需設定 Webhook URL 為 `https://<your-domain>:8080/webhook`
+- 圖片字型依賴 Windows 字型（`NotoSansTC-VF.ttf` / `msjhbd.ttc`），Linux 需另行安裝
