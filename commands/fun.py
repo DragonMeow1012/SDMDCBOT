@@ -1,5 +1,5 @@
 """
-趣味指令：/電子氣泡紙、/電子木魚、/電子木魚功德排行榜、/賽博體重計、/擲硬幣、/擲硬幣幹話版
+趣味指令：/電子氣泡紙、/電子木魚、/電子木魚功德排行榜、/清除功德排行榜、/賽博體重計、/擲硬幣、/擲硬幣幹話版
 """
 import asyncio
 import json
@@ -7,6 +7,8 @@ import os
 import random
 import discord
 from discord import app_commands
+
+from config import MASTER_ID
 
 
 _MERIT_FILE = os.path.join('data', 'merit.json')
@@ -29,7 +31,7 @@ class MeritView(discord.ui.View):
         super().__init__(timeout=None)
         self.session_count = 0
 
-    @discord.ui.button(label='🪘 功德+1', style=discord.ButtonStyle.success, custom_id='merit_btn')
+    @discord.ui.button(label='功德+1', style=discord.ButtonStyle.success, custom_id='merit_btn')
     async def merit_btn(self, interaction: discord.Interaction, _btn: discord.ui.Button):
         uid = str(interaction.user.id)
         data = _load_merit()
@@ -38,7 +40,7 @@ class MeritView(discord.ui.View):
         self.session_count += 1
         nick = interaction.user.display_name
         await interaction.response.edit_message(
-            content=f'🪵🐟 **電子木魚**\n'
+            content=f'**電子木魚**\n'
                     f'本次功德：**{self.session_count}** 下\n'
                     f'（{nick} 累計功德：**{data[uid]}** 下）')
 
@@ -235,10 +237,10 @@ def setup(tree: app_commands.CommandTree) -> None:
         grid = '\n'.join(' '.join('||啵||' for _ in range(cols)) for _ in range(rows))
         await interaction.response.send_message(f' **電子氣泡紙 {cols}×{rows}**\n{grid}')
 
-    @tree.command(name="電子木魚", description="發送一個電子木魚，按下按鈕敲木魚，每次積累一點功德🪘")
+    @tree.command(name="電子木魚", description="發送一個電子木魚，按下按鈕敲木魚，每次積累一點功德")
     async def slash_merit(interaction: discord.Interaction):
         view = MeritView()
-        await interaction.response.send_message('🪘 **電子木魚**\n本次功德：**0** 下', view=view)
+        await interaction.response.send_message('**電子木魚**\n本次功德：**0** 下', view=view)
 
     @tree.command(name="電子木魚功德排行榜", description="查看本伺服器敲木魚功德累積次數 TOP10 排行榜")
     async def slash_merit_rank(interaction: discord.Interaction):
@@ -247,13 +249,26 @@ def setup(tree: app_commands.CommandTree) -> None:
             await interaction.response.send_message('還沒有人積過功德喵！', ephemeral=True)
             return
         sorted_data = sorted(data.items(), key=lambda x: x[1], reverse=True)
-        lines = ['🪘 **功德排行榜 TOP10**']
+        lines = ['**功德排行榜 TOP10**']
         guild = interaction.guild
         for i, (uid, cnt) in enumerate(sorted_data[:10], 1):
             member = guild.get_member(int(uid)) if guild else None
             name = member.display_name if member else f'用戶{uid}'
-            lines.append(f'`{i}.` {name} — **{cnt}** 下')
+            lines.append(f'`{i}.` {name} — **{cnt}** 次')
         await interaction.response.send_message('\n'.join(lines))
+
+    @tree.command(name="清除功德排行榜", description="清除所有用戶的功德記錄，無法復原。（主人限定）")
+    async def slash_merit_clear(interaction: discord.Interaction):
+        if interaction.user.id != MASTER_ID:
+            await interaction.response.send_message('此指令限主人使用喵！', ephemeral=True)
+            return
+        data = _load_merit()
+        if not data:
+            await interaction.response.send_message('功德排行榜本來就是空的喵！', ephemeral=True)
+            return
+        with open(_MERIT_FILE, 'w', encoding='utf-8') as f:
+            json.dump({}, f)
+        await interaction.response.send_message('✅ 功德排行榜已清除！', ephemeral=True)
 
     @tree.command(name="賽博體重計", description="量測你的賽博體重，體重過重有機率觸發特殊反應")
     async def slash_weight(interaction: discord.Interaction):

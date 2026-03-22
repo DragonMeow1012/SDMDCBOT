@@ -22,10 +22,6 @@ def _save_rel(data: dict) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def _get_name(guild: discord.Guild, uid: str) -> str:
-    member = guild.get_member(int(uid))
-    return member.display_name if member else f'用戶{uid}'
-
 
 class RelationView(discord.ui.View):
     """通用認養/認主人確認按鈕。mode: 'pet'=認養寵物, 'master'=認主人"""
@@ -142,35 +138,29 @@ def setup(tree: app_commands.CommandTree) -> None:
             await interaction.response.send_message('本群還沒有任何主寵關係喵！', ephemeral=True)
             return
 
-        master_map: dict[str, list[str]] = {}
-        for pet_id, master_id in rels.items():
-            master_map.setdefault(master_id, []).append(pet_id)
+        await interaction.response.defer()
+
+        # 收集所有需要查名字的 UID，逐一 fetch（快取優先）
+        all_uids = set(rels.keys()) | set(rels.values())
+        name_map: dict[str, str] = {}
+        for uid in all_uids:
+            member = guild.get_member(int(uid))
+            if not member:
+                try:
+                    member = await guild.fetch_member(int(uid))
+                except discord.NotFound:
+                    pass
+            if member:
+                name_map[uid] = member.display_name
+
+        def get_name(uid: str) -> str:
+            return name_map.get(uid) or uid
 
         lines = ['🐾 **本群主寵關係圖**']
-        visited: set[str] = set()
+        for pet_id, master_id in rels.items():
+            lines.append(f'主人：{get_name(master_id)} → 寵物：{get_name(pet_id)}')
 
-        def build_tree(uid: str, depth: int):
-            indent = '　' * depth
-            name = _get_name(guild, uid)
-            tag = '👑' if uid in master_map else '🐾'
-            lines.append(f'{indent}{tag} {name}')
-            visited.add(uid)
-            for pet in master_map.get(uid, []):
-                if pet not in visited:
-                    build_tree(pet, depth + 1)
-
-        roots = [m for m in master_map if m not in rels]
-        for root in roots:
-            build_tree(root, 0)
-
-        orphans = [p for p in rels if p not in visited]
-        if orphans:
-            lines.append('\n**— 其他關係 —**')
-            for pet_id in orphans:
-                master_id = rels[pet_id]
-                lines.append(f'🐾 {_get_name(guild, pet_id)} → 主人：{_get_name(guild, master_id)}')
-
-        await interaction.response.send_message('\n'.join(lines))
+        await interaction.followup.send('\n'.join(lines))
 
     @tree.command(name="賽博釣群友", description="放出釣魚按鈕，點下「咬鉤」的人會被 Webhook 偽裝發出一則訊息🪝")
     async def slash_fishing(interaction: discord.Interaction):

@@ -1,6 +1,7 @@
 """
 炮決指令：/炮決蘿莉控、/炮決排行、/清除炮決名單
 """
+import asyncio
 import json
 import os
 import random
@@ -22,47 +23,64 @@ def _load_artillery() -> dict:
 
 
 def _save_artillery(data: dict) -> None:
+    os.makedirs(os.path.dirname(_ARTILLERY_FILE), exist_ok=True)
     with open(_ARTILLERY_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def setup(tree: app_commands.CommandTree) -> None:
 
-    @tree.command(name="炮決蘿莉控", description="從頻道成員隨機或指定一人炮決💀，並記錄累計被炮決次數")
-    @app_commands.describe(用戶="指定炮決對象（不填則隨機）")
+    @tree.command(name="炮決蘿莉控", description="砲擊指定或隨機一位蘿莉控💀，並累計記錄被炮決次數")
+    @app_commands.describe(用戶="砲擊對象（不填則從頻道隨機抽一人）")
     async def slash_artillery(interaction: discord.Interaction, 用戶: discord.Member = None):
-        channel = interaction.channel
         guild   = interaction.guild
-        if guild is None:
+        channel = interaction.channel
+        if guild is None or channel is None:
             await interaction.response.send_message('此指令只能在伺服器中使用！', ephemeral=True)
             return
 
+        # ── 決定受害者 ──────────────────────────────────────────
         if 用戶 is not None:
             victim = 用戶
         else:
-            members = [m for m in guild.members if not m.bot and channel.permissions_for(m).read_messages]
+            await interaction.response.defer()
+            if not guild.chunked:
+                try:
+                    await asyncio.wait_for(guild.chunk(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
+            members = (
+                [m for m in channel.members if not m.bot]
+                if isinstance(channel, discord.TextChannel)
+                else [m for m in guild.members if not m.bot]
+            )
             if not members:
-                await interaction.response.send_message('找不到可炮決的對象喵...', ephemeral=True)
+                await interaction.followup.send('找不到可砲擊的對象喵...', ephemeral=True)
                 return
             victim = random.choice(members)
 
+        # ── 更新紀錄 ────────────────────────────────────────────
         uid = str(victim.id)
         gid = str(guild.id)
-
         records = _load_artillery()
-        if gid not in records:
-            records[gid] = {}
-        records[gid][uid] = records[gid].get(uid, 0) + 1
+        records.setdefault(gid, {})[uid] = records.get(gid, {}).get(uid, 0) + 1
         count = records[gid][uid]
         _save_artillery(records)
 
-        nick = victim.display_name
-        await interaction.response.send_message(
-            f'今天炮決的是 {victim.mention}（{nick}）💀\n'
-            f'（累計被炮決 **{count}** 次）',
-            file=discord.File(_ARTILLERY_IMG))
+        # ── 回覆訊息 ────────────────────────────────────────────
+        text = (
+            f'💀 今天的蘿莉控是 {victim.mention}（{victim.display_name}）！\n'
+            f'（累計被炮決 **{count}** 次）'
+        )
+        send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
 
-    @tree.command(name="炮決排行", description="查看本伺服器被炮決次數 TOP10 排行榜💀")
+        if os.path.exists(_ARTILLERY_IMG):
+            await send(text, file=discord.File(_ARTILLERY_IMG))
+        else:
+            await send(text)
+
+    # ── 排行榜 ──────────────────────────────────────────────────
+    @tree.command(name="炮決排行", description="查看本伺服器被炮決次數 TOP 10 排行榜💀")
     async def slash_artillery_rank(interaction: discord.Interaction):
         guild = interaction.guild
         if guild is None:
@@ -75,14 +93,22 @@ def setup(tree: app_commands.CommandTree) -> None:
             await interaction.response.send_message('還沒有人被炮決過喵！', ephemeral=True)
             return
 
-        sorted_records = sorted(records[gid].items(), key=lambda x: x[1], reverse=True)
-        lines = ['💀 **炮決排行榜** 💀']
-        for i, (uid, cnt) in enumerate(sorted_records[:10], 1):
-            member = guild.get_member(int(uid))
-            name = member.display_name if member else f'（已離開 {uid}）'
-            lines.append(f'`{i}.` {name} — **{cnt}** 次')
-        await interaction.response.send_message('\n'.join(lines))
+        top10 = sorted(records[gid].items(), key=lambda x: x[1], reverse=True)[:10]
 
+        await interaction.response.defer()
+        lines = ['💀 **炮決排行榜** 💀']
+        for rank, (uid, cnt) in enumerate(top10, 1):
+            member = guild.get_member(int(uid))
+            if not member:
+                try:
+                    member = await guild.fetch_member(int(uid))
+                except discord.NotFound:
+                    pass
+            name = member.display_name if member else f'（已離開：{uid}）'
+            lines.append(f'`{rank}.` {name} — **{cnt}** 次')
+        await interaction.followup.send('\n'.join(lines))
+
+    # ── 清除紀錄（主人限定） ────────────────────────────────────
     @tree.command(name="清除炮決名單", description="清除本伺服器的所有炮決記錄，無法復原。（主人限定）")
     async def slash_artillery_clear(interaction: discord.Interaction):
         if interaction.user.id != MASTER_ID:

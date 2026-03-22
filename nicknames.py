@@ -69,5 +69,5 @@ def build_all_nicknames_summary(nicknames: dict[str, str]) -> str:
     """
     if not nicknames:
         return '[已知用戶暱稱: 無]'
-    entries = ', '.join(f'{uid}={nick}' for uid, nick in nicknames.items())
+    entries = ', '.join(nick for nick in nicknames.values())
     return f'[已知用戶暱稱清單: {entries}]'

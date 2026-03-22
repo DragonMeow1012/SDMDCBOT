@@ -9,7 +9,8 @@ import time
 from config import DATA_DIR
 
 SUMMARIES_DIR = os.path.join(DATA_DIR, "summaries")
-MAX_LINES = 1000  # 保留最近幾條訊息（user + model 各一條 = 一輪算兩條）
+MAX_LINES = 50    # 保留最近幾條訊息（user + model 各一條 = 一輪算兩條）
+MAX_CHARS = 1000  # 摘要總字數上限
 
 _ROLE_LABEL = {'user': '[User]', 'model': '[Bot]'}
 
@@ -45,8 +46,11 @@ def save_summary(channel_id: int | str, hist: list[dict]) -> None:
     """
     _ensure_dir()
     lines = _hist_to_lines(hist)
-    # 只保留最後 MAX_LINES 條
     lines = lines[-MAX_LINES:]
+
+    # 字數上限：從最舊的開始刪，直到總字數 ≤ MAX_CHARS
+    while lines and sum(len(l) for l in lines) > MAX_CHARS:
+        lines.pop(0)
 
     path = os.path.join(SUMMARIES_DIR, f"{channel_id}.txt")
     header = (

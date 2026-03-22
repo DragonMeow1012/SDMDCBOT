@@ -19,6 +19,9 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8', line_buffering=True)
 
+from logger import setup_logger
+setup_logger()
+
 from config import DISCORD_TOKEN, MASTER_ID
 from history import load_history, save_history
 from web import fetch_url
@@ -38,6 +41,7 @@ from commands.kb import handle_kb_command
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
@@ -153,9 +157,9 @@ async def on_message(msg: discord.Message) -> None:
     display_name = msg.author.display_name
 
     if nick:
-        user_ctx = f'[User ID: {msg.author.id}, 暱稱: {nick}]'
+        user_ctx = f'[用戶: {nick}]'
     else:
-        user_ctx = f'[User ID: {msg.author.id}, 伺服器名稱: {display_name}]'
+        user_ctx = f'[用戶: {display_name}]'
 
     if is_master:
         nick_summary    = build_all_nicknames_summary(state.nicknames)
@@ -201,23 +205,10 @@ async def on_message(msg: discord.Message) -> None:
     # 以圖搜圖（關鍵字觸發）
     if file_parts and _is_source_query(prompt):
         await msg.channel.send('喵嗚~ 正在以圖搜圖，尋找來源中...')
-        search_results = await reverse_image_search(
+        result = await reverse_image_search(
             file_parts[-1]['data'], file_parts[-1]['mime_type'])
-        prompt = (
-            f'[以圖搜圖結果]\n{search_results}\n\n'
-            f'用戶問題：{prompt}\n\n'
-            f'[指示]\n'
-            f'請根據上方搜尋結果挑選最相關的來源連結並輸出。\n'
-            f'優先來源：pixiv、twitter、x.com、nhentai。若這些來源都沒有，再輸出其他最相關連結。\n\n'
-            f'輸出格式（嚴格遵守）：\n'
-            f'來源名稱(pixiv/X/twitter/nhentai等) | 作品名稱 | 作者\n'
-            f'連結：**完整網址**\n\n'
-            f'規則：\n'
-            f'- 每筆結果佔兩行，第一行是來源名稱|作品|作者，第二行是連結\n'
-            f'- 連結必須用 **網址** 加粗包住，禁止使用 [文字](連結) 格式，禁止裸露網址\n'
-            f'- 不需特別強調是連篇漫畫或單張插畫\n'
-            f'- 不得添加任何額外說明或延伸內容'
-        )
+        await msg.reply(result)
+        return
 
     # URL 偵測
     if url_match := re.search(r'https?://[^\s\)\]\>\"\'`]+(?<![.,;:!?])', prompt):
