@@ -226,16 +226,35 @@ _COIN_DRAMA = [
 
 def setup(tree: app_commands.CommandTree) -> None:
 
-    @tree.command(name="電子氣泡紙", description="發送一片可點擊的電子氣泡紙，每格「啵」都是獨立的防雷標籤，點一下啵一下！")
-    @app_commands.describe(尺寸="氣泡紙大小")
+    @tree.command(name="電子氣泡紙", description="發送一片可點擊的電子氣泡紙，點一下啵一下！")
+    @app_commands.describe(
+        尺寸="選擇預設尺寸或自訂",
+        長="自訂列數（1~50，尺寸選自訂時生效）",
+        寬="自訂欄數（1~50，尺寸選自訂時生效）",
+    )
     @app_commands.choices(尺寸=[
         app_commands.Choice(name="5×2（10顆）",  value="5x2"),
         app_commands.Choice(name="10×5（50顆）", value="10x5"),
+        app_commands.Choice(name="自訂",          value="custom"),
     ])
-    async def slash_bubblewrap(interaction: discord.Interaction, 尺寸: str = "5x2"):
-        cols, rows = (5, 2) if 尺寸 == "5x2" else (10, 5)
+    async def slash_bubblewrap(
+        interaction: discord.Interaction,
+        尺寸: str = "5x2",
+        長: app_commands.Range[int, 1, 50] = None,
+        寬: app_commands.Range[int, 1, 50] = None,
+    ):
+        if 尺寸 == "custom":
+            if 長 is None or 寬 is None:
+                await interaction.response.send_message('自訂尺寸需同時填入「長」與「寬」（各 1～50）喵！', ephemeral=True)
+                return
+            rows, cols = 長, 寬
+        elif 尺寸 == "5x2":
+            rows, cols = 2, 5
+        else:
+            rows, cols = 5, 10
+
         grid = '\n'.join(' '.join('||啵||' for _ in range(cols)) for _ in range(rows))
-        await interaction.response.send_message(f' **電子氣泡紙 {cols}×{rows}**\n{grid}')
+        await interaction.response.send_message(f'**電子氣泡紙 {cols}×{rows}**\n{grid}')
 
     @tree.command(name="電子木魚", description="發送一個電子木魚，按下按鈕敲木魚，每次積累一點功德")
     async def slash_merit(interaction: discord.Interaction):
