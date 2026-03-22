@@ -209,10 +209,12 @@ async def on_message(msg: discord.Message) -> None:
             f'[指示]\n'
             f'請根據上方搜尋結果挑選最相關的來源連結並輸出。\n'
             f'優先來源：pixiv、twitter、x.com、nhentai。若這些來源都沒有，再輸出其他最相關連結。\n\n'
-            f'輸出格式：\n'
-            f'- 每筆結果獨立一行，格式：X/twitter/pixiv/nhentai | 作品名 | 作者\n'
-            f'  連結：**網址**\n'
-            f'- 連結格式必須使用 **網址** 加粗顯示，不要使用 [文字](連結) 超連結格式\n'
+            f'輸出格式（嚴格遵守）：\n'
+            f'來源名稱(pixiv/X/twitter/nhentai等) | 作品名稱 | 作者\n'
+            f'連結：**完整網址**\n\n'
+            f'規則：\n'
+            f'- 每筆結果佔兩行，第一行是來源名稱|作品|作者，第二行是連結\n'
+            f'- 連結必須用 **網址** 加粗包住，禁止使用 [文字](連結) 格式，禁止裸露網址\n'
             f'- 不需特別強調是連篇漫畫或單張插畫\n'
             f'- 不得添加任何額外說明或延伸內容'
         )
@@ -244,19 +246,6 @@ async def on_message(msg: discord.Message) -> None:
     kb_ctx       = build_knowledge_context(state.knowledge_entries)
     final_prompt = (kb_ctx + identity_prefix + prompt) if kb_ctx else (identity_prefix + prompt)
 
-    # 圖片附件 → 回應後自動存入 KB
-    has_image = any(fp['mime_type'].startswith('image/') for fp in file_parts)
-    kb_save = None
-    if has_image:
-        img_filename = next(
-            (a.filename for a in msg.attachments if (a.content_type or '').startswith('image/')),
-            'image')
-        kb_save = {
-            'entries':  state.knowledge_entries,
-            'saved_by': msg.author.id,
-            'label':    img_filename,
-        }
-
     await msg_queue.put({
         'channel_id':  cid,
         'prompt_text': final_prompt,
@@ -264,7 +253,7 @@ async def on_message(msg: discord.Message) -> None:
         'reply_fn':    msg.reply,
         'send_fn':     msg.channel.send,
         'typing_ctx':  msg.channel.typing(),
-        'kb_save':     kb_save,
+        'kb_save':     None,
     })
 
 
