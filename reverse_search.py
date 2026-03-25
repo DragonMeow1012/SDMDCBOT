@@ -58,6 +58,7 @@ def _parse_saucenao_entry(r: dict) -> dict | None:
     source = _INDEX_NAMES.get(idx, hdr.get('index_name', ''))
     title  = dat.get('title') or dat.get('material') or '未知'
     author = dat.get('member_name') or dat.get('creator') or dat.get('author') or ''
+    page   = dat.get('part') or dat.get('page') or ''
 
     ext_urls   = hdr.get('ext_urls', [])
     dat_source = dat.get('source', '')
@@ -66,11 +67,21 @@ def _parse_saucenao_entry(r: dict) -> dict | None:
     if idx == 18 and dat.get('nh_id'):
         url = url or f'https://nhentai.net/g/{dat["nh_id"]}/'
 
+    # nhentai URL 格式：nhentai.net/g/{id}/{page}
+    # 從 URL 提取頁數，並將 URL 還原為不含頁數的作品連結
+    if 'nhentai.net/g/' in url:
+        parts = url.rstrip('/').split('/')
+        if len(parts) >= 2 and parts[-1].isdigit():
+            if not page:
+                page = parts[-1]
+            url = '/'.join(parts[:-1])
+
     return {
         'engine':     'SauceNAO',
         'source':     source,
         'title':      title,
         'author':     author,
+        'page':       str(page) if page else '',
         'url':        url,
         'similarity': sim,
     }
@@ -198,16 +209,21 @@ async def _soutubot_search(image_data: bytes, mime_type: str) -> list[dict]:
 
         results = []
         for item in captured[:3]:
-            source = item.get('source', '')
-            title  = item.get('title') or '未知'
-            subj   = item.get('subjectPath', '')
-            base   = _SOUTUBOT_BASE_URLS.get(source, f'https://{source}' if source else '')
-            url    = (base + subj) if subj else ''
+            source    = item.get('source', '')
+            title     = item.get('title') or '未知'
+            page      = str(item.get('page', '')) if item.get('page') is not None else ''
+            page_path = item.get('pagePath', '')
+            subj      = item.get('subjectPath', '')
+            base      = _SOUTUBOT_BASE_URLS.get(source, f'https://{source}' if source else '')
+            # 連結固定用作品 URL（不含頁數）
+            path      = subj
+            url       = (base + path) if path else ''
             results.append({
                 'engine':     'soutubot',
                 'source':     source,
                 'title':      title,
                 'author':     '',
+                'page':       page,
                 'url':        url,
                 'similarity': 99.0,
             })
@@ -226,10 +242,16 @@ def _format_result(i: int, r: dict) -> str:
     source = r['source'] or '未知來源'
     title  = r['title']
     author = r['author']
+    page   = r.get('page', '')
     sim    = r['similarity']
     url    = r['url']
-    header = f'{source} | {title} | {author} |' if author else f'{source} | {title} |'
-    return f'`{i}.` {header} {sim:.1f}%\n**{url}**'
+    parts  = [source, title]
+    if author:
+        parts.append(author)
+    if page:
+        parts.append(f'page {page}')
+    parts.append(f'{sim:.1f}%')
+    return f'`{i}.` {" | ".join(parts)}\n連結:**{url}**'
 
 
 # ── 主搜尋入口 ────────────────────────────────────────────────────────────────
@@ -261,12 +283,12 @@ async def reverse_image_search(image_data: bytes, mime_type: str) -> str:
             lines.append(_format_result(i, r))
         return '\n\n'.join(lines)
 
-    other_hits = _hits(soutu)
+    other_hits = [r for r in _hits(soutu) if r.get('page')]
     if other_hits:
-        print(f'[RSEARCH] SauceNAO 無符合，soutubot 命中 {len(other_hits)} 筆')
+        print(f'[RSEARCH] SauceNAO 無符合，soutubot 命中（含page）{len(other_hits)} 筆')
         lines = [f'找到 {len(other_hits)} 筆相似度 ≥{_SIM_THRESHOLD}% 的結果：']
         for i, r in enumerate(other_hits, 1):
             lines.append(_format_result(i, r))
         return '\n\n'.join(lines)
 
-    return f'找不到相似度 {_SIM_THRESHOLD}% 以上的圖片來源。'
+    return '找不到相似的資訊喵QQ'

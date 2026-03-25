@@ -8,6 +8,7 @@ import discord
 from discord import app_commands
 
 from config import MASTER_ID
+from commands.whip import is_trainer_of
 
 _MAX_SECONDS = 2419200   # Discord timeout 上限 28 天
 
@@ -101,15 +102,17 @@ def setup(tree: app_commands.CommandTree) -> None:
             await interaction.response.send_message('不能對 Bot 套口球喵！', ephemeral=True)
             return
 
-        # 主人或自願 → 直接套用
-        if is_master or is_self:
+        # 主人、自願或已建立調教關係 → 直接套用
+        is_trainer = (interaction.guild is not None and
+                      is_trainer_of(interaction.guild.id, interaction.user.id, target.id))
+        if is_master or is_self or is_trainer:
             err = await _apply_gag(target, 秒數)
             if err:
                 await interaction.response.send_message(err, ephemeral=True)
             else:
                 await interaction.response.send_message(
                     f'{target.mention} 已戴上電子口球 {秒數} 秒！',
-                    ephemeral=is_self and not is_master,
+                    ephemeral=is_self and not is_master and not is_trainer,
                 )
             return
 

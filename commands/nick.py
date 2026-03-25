@@ -9,6 +9,16 @@ from nicknames import save_nicknames
 import state
 
 
+_MASTER_KEYWORDS = frozenset({
+    '主人', '主子', '主宰', '老大', '大人', '主', 'master', 'Master', 'MASTER',
+})
+
+
+def _contains_master_keyword(text: str) -> bool:
+    lower = text.lower()
+    return any(kw.lower() in lower for kw in _MASTER_KEYWORDS)
+
+
 def setup(tree: app_commands.CommandTree) -> None:
 
     @tree.command(name="nick", description="設定你的暱稱，模型會優先用暱稱稱呼你。主人可指定對象。")
@@ -19,6 +29,10 @@ def setup(tree: app_commands.CommandTree) -> None:
 
         if target.id != interaction.user.id and not is_master:
             await interaction.response.send_message('你只能設定自己的暱稱喵！', ephemeral=True)
+            return
+
+        if not is_master and _contains_master_keyword(暱稱):
+            await interaction.response.send_message('暱稱不能包含主人相關詞彙喵！', ephemeral=True)
             return
 
         state.nicknames[str(target.id)] = 暱稱

@@ -314,3 +314,15 @@ def setup(tree: app_commands.CommandTree) -> None:
 
         await asyncio.sleep(random.uniform(1.2, 2.0))
         await interaction.channel.send(f'硬幣落地！結果是⋯⋯ {result}！')
+
+    @tree.command(name="roll", description="從 1~100 隨機抽一個數字")
+    async def slash_roll(interaction: discord.Interaction):
+        n    = random.randint(1, 100)
+        name = interaction.user.display_name
+        await interaction.response.send_message(f'{name} 抽到了 **{n}** 點！')
+
+    @tree.command(name="丟骰子", description="投一顆六面骰，隨機出現 1~6")
+    async def slash_dice(interaction: discord.Interaction):
+        n    = random.randint(1, 6)
+        name = interaction.user.display_name
+        await interaction.response.send_message(f'{name} 投到了 **{n}** 點！')
