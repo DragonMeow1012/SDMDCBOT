@@ -6,7 +6,7 @@ import asyncio
 import io
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import random
 import discord
 from discord import app_commands
@@ -30,7 +30,7 @@ def _save_wife(data: dict) -> None:
 
 
 def _today_key() -> str:
-    return datetime.now().strftime(_DAY_KEY_FMT)
+    return datetime.now(timezone(timedelta(hours=8))).strftime(_DAY_KEY_FMT)
 
 
 def _record_day_key(rec: dict) -> str | None:
@@ -72,7 +72,7 @@ def get_active_wife_rels(guild_id: int) -> dict[str, str]:
 
 def setup(tree: app_commands.CommandTree) -> None:
 
-    @tree.command(name="抽今日老婆", description="從本群隨機抽一位成員作為你的老婆（每次都會重新抽）💕")
+    @tree.command(name="抽今日老婆", description="從本群隨機抽一位成員作為你的老婆（當日只會抽一次）💕")
     async def slash_draw_wife(interaction: discord.Interaction):
         guild = interaction.guild
         if guild is None:
@@ -101,28 +101,48 @@ def setup(tree: app_commands.CommandTree) -> None:
             )
             return
 
-        wife    = random.choice(candidates)
-        wife_id = str(wife.id)
-
-        # 儲存（每次都覆蓋，重新計時）
+        # 儲存與讀取（當日有抽過就直接沿用）
         gid  = str(guild.id)
         uid  = str(interaction.user.id)
         data = _purge_expired(_load_wife())
-        data.setdefault(gid, {})[uid] = {
-            'date':    _today_key(),
-            'wife_id': wife_id,
-        }
-        _save_wife(data)
+        rec  = data.get(gid, {}).get(uid)
+
+        wife = None
+        wife_id = None
+        if rec is not None and _record_day_key(rec) == _today_key():
+            wife_id = rec.get('wife_id')
+            if wife_id:
+                wife = guild.get_member(int(wife_id))
+                if wife is None:
+                    try:
+                        wife = await guild.fetch_member(int(wife_id))
+                    except discord.NotFound:
+                        wife = None
+        else:
+            wife    = random.choice(candidates)
+            wife_id = str(wife.id)
+            data.setdefault(gid, {})[uid] = {
+                'date':    _today_key(),
+                'wife_id': wife_id,
+            }
+            _save_wife(data)
 
         # 取得頭像
-        name       = wife.display_name
-        avatar_url = str(wife.display_avatar.replace(size=512).url)
+        if wife is not None:
+            name       = wife.display_name
+            avatar_url = str(wife.display_avatar.replace(size=512).url)
+        else:
+            name       = f'<@{wife_id}>' if wife_id else '對方'
+            avatar_url = None
 
         import requests as _req
-        try:
-            resp         = await asyncio.to_thread(_req.get, avatar_url, timeout=8)
-            avatar_bytes = resp.content if resp.status_code == 200 else None
-        except Exception:
+        if avatar_url:
+            try:
+                resp         = await asyncio.to_thread(_req.get, avatar_url, timeout=8)
+                avatar_bytes = resp.content if resp.status_code == 200 else None
+            except Exception:
+                avatar_bytes = None
+        else:
             avatar_bytes = None
 
         text = f'你今天的老婆是：**{name}**\n要好好對待她哦{_LOVE_EMOJI}'

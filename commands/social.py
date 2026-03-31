@@ -272,7 +272,7 @@ def setup(tree: app_commands.CommandTree) -> None:
         try:
             from graph_render import render_relation_graph
             buf = await render_relation_graph(guild, rels, wife_rels)
-            embed = discord.Embed(color=discord.Color.blurple())
+            embed = discord.Embed(title='今日羈絆圖譜', color=discord.Color.blurple())
             embed.set_image(url='attachment://relations.png')
             await interaction.followup.send(
                 embed=embed,
