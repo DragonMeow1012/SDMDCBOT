@@ -6,7 +6,7 @@ import asyncio
 import io
 import json
 import os
-import time
+from datetime import datetime
 import random
 import discord
 from discord import app_commands
@@ -14,7 +14,7 @@ from discord import app_commands
 
 _WIFE_FILE  = os.path.join('data', 'wife_records.json')
 _LOVE_EMOJI = '<:klllove:1486300373068152832>'
-_TTL        = 86400   # 24 小時（秒）
+_DAY_KEY_FMT = "%Y-%m-%d"
 
 
 def _load_wife() -> dict:
@@ -29,12 +29,28 @@ def _save_wife(data: dict) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def _today_key() -> str:
+    return datetime.now().strftime(_DAY_KEY_FMT)
+
+
+def _record_day_key(rec: dict) -> str | None:
+    if "date" in rec:
+        return rec.get("date")
+    ts = rec.get("timestamp")
+    if ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(ts).strftime(_DAY_KEY_FMT)
+    except Exception:
+        return None
+
+
 def _purge_expired(data: dict) -> dict:
-    """移除所有已過期（>24h）的紀錄。"""
-    now = time.time()
+    """移除所有已過期（跨日）的紀錄。"""
+    today = _today_key()
     for gid in list(data):
         for uid in list(data[gid]):
-            if now - data[gid][uid].get('timestamp', 0) > _TTL:
+            if _record_day_key(data[gid][uid]) != today:
                 del data[gid][uid]
         if not data[gid]:
             del data[gid]
@@ -48,9 +64,8 @@ def get_active_wife_rels(guild_id: int) -> dict[str, str]:
     data   = _purge_expired(_load_wife())
     gid    = str(guild_id)
     result = {}
-    now    = time.time()
     for uid, rec in data.get(gid, {}).items():
-        if now - rec.get('timestamp', 0) <= _TTL:
+        if _record_day_key(rec) == _today_key():
             result[uid] = rec['wife_id']
     return result
 
@@ -61,7 +76,10 @@ def setup(tree: app_commands.CommandTree) -> None:
     async def slash_draw_wife(interaction: discord.Interaction):
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message('此指令只能在伺服器中使用！', ephemeral=True)
+            await interaction.response.send_message(
+                embed=discord.Embed(description='此指令只能在伺服器中使用！', color=discord.Color.red()),
+                ephemeral=True
+            )
             return
 
         await interaction.response.defer()
@@ -77,7 +95,10 @@ def setup(tree: app_commands.CommandTree) -> None:
             if not m.bot and m.id != interaction.user.id
         ]
         if not candidates:
-            await interaction.followup.send('找不到可以抽的對象喵QQ', ephemeral=True)
+            await interaction.followup.send(
+                embed=discord.Embed(description='找不到可以抽的對象喵QQ', color=discord.Color.red()),
+                ephemeral=True
+            )
             return
 
         wife    = random.choice(candidates)
@@ -88,8 +109,8 @@ def setup(tree: app_commands.CommandTree) -> None:
         uid  = str(interaction.user.id)
         data = _purge_expired(_load_wife())
         data.setdefault(gid, {})[uid] = {
-            'timestamp': time.time(),
-            'wife_id':   wife_id,
+            'date':    _today_key(),
+            'wife_id': wife_id,
         }
         _save_wife(data)
 
@@ -105,39 +126,50 @@ def setup(tree: app_commands.CommandTree) -> None:
             avatar_bytes = None
 
         text = f'你今天的老婆是：**{name}**\n要好好對待她哦{_LOVE_EMOJI}'
+        embed = discord.Embed(description=text, color=discord.Color.pink())
         if avatar_bytes:
             await interaction.followup.send(
-                text,
+                embed=embed.set_image(url='attachment://wife.png'),
                 file=discord.File(io.BytesIO(avatar_bytes), filename='wife.png'),
             )
         else:
-            await interaction.followup.send(text)
+            await interaction.followup.send(embed=embed)
 
     @tree.command(name="強娶老婆", description="強制指定一位成員作為你的老婆，取代原有老婆")
     @app_commands.describe(用戶="要強娶的對象")
     async def slash_force_wife(interaction: discord.Interaction, 用戶: discord.Member):
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message('此指令只能在伺服器中使用！', ephemeral=True)
+            await interaction.response.send_message(
+                embed=discord.Embed(description='此指令只能在伺服器中使用！', color=discord.Color.red()),
+                ephemeral=True
+            )
             return
         if 用戶.bot:
-            await interaction.response.send_message('不能強娶 Bot 喵！', ephemeral=True)
+            await interaction.response.send_message(
+                embed=discord.Embed(description='不能強娶 Bot 喵！', color=discord.Color.red()),
+                ephemeral=True
+            )
             return
         if 用戶.id == interaction.user.id:
-            await interaction.response.send_message('不能娶自己喵！', ephemeral=True)
+            await interaction.response.send_message(
+                embed=discord.Embed(description='不能娶自己喵！', color=discord.Color.red()),
+                ephemeral=True
+            )
             return
 
         gid  = str(guild.id)
         uid  = str(interaction.user.id)
         data = _purge_expired(_load_wife())
         data.setdefault(gid, {})[uid] = {
-            'timestamp': time.time(),
-            'wife_id':   str(用戶.id),
+            'date':    _today_key(),
+            'wife_id': str(用戶.id),
         }
         _save_wife(data)
 
+        text = f' {interaction.user.mention} 強娶了 {用戶.mention} 作為老婆！{_LOVE_EMOJI}'
         await interaction.response.send_message(
-            f' {interaction.user.mention} 強娶了 {用戶.mention} 作為老婆！{_LOVE_EMOJI}'
+            embed=discord.Embed(description=text, color=discord.Color.pink())
         )
 
     @tree.command(name="拋棄婚約", description="解除指定用戶對你的婚姻關係💔")
@@ -150,13 +182,17 @@ def setup(tree: app_commands.CommandTree) -> None:
 
         rec = data.get(gid, {}).get(uid)
         if rec is None or rec.get('wife_id') != my_id:
-            await interaction.response.send_message('對方跟你沒有婚姻關係喵！', ephemeral=True)
+            await interaction.response.send_message(
+                embed=discord.Embed(description='對方跟你沒有婚姻關係喵！', color=discord.Color.red()),
+                ephemeral=True
+            )
             return
 
         data[gid].pop(uid)
         _save_wife(data)
+        text = f'{interaction.user.mention} 跟 {用戶.mention} 離婚了<:crycat:1486308949173997730>'
         await interaction.response.send_message(
-            f'{interaction.user.mention} 跟 {用戶.mention} 離婚了<:crycat:1486308949173997730>'
+            embed=discord.Embed(description=text, color=discord.Color.red())
         )
 
     @tree.command(name="和今日老婆離婚", description="與目前的老婆離婚💔")
@@ -166,9 +202,28 @@ def setup(tree: app_commands.CommandTree) -> None:
         data = _purge_expired(_load_wife())
 
         if uid not in data.get(gid, {}):
-            await interaction.response.send_message('你目前沒有老婆喵！', ephemeral=True)
+            await interaction.response.send_message(
+                embed=discord.Embed(description='你目前沒有老婆喵！', color=discord.Color.red()),
+                ephemeral=True
+            )
             return
 
+        wife_id = data[gid][uid].get('wife_id')
         data[gid].pop(uid)
         _save_wife(data)
-        await interaction.response.send_message('💔 離婚成功，可以重新抽老婆了。')
+        wife_name = '對方'
+        if wife_id and interaction.guild:
+            member = interaction.guild.get_member(int(wife_id))
+            if member is None:
+                try:
+                    member = await interaction.guild.fetch_member(int(wife_id))
+                except discord.NotFound:
+                    member = None
+            if member:
+                wife_name = member.display_name
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                description=f'你已和{wife_name}離婚了<:crycat:1486308949173997730>',
+                color=discord.Color.red()
+            )
+        )

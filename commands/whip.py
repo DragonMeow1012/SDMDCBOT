@@ -11,7 +11,7 @@ from config import MASTER_ID
 
 _WHIP_FILE = os.path.join('data', 'whip_records.json')
 _WHIP_REL_FILE = os.path.join('data', 'whip_relations.json')
-_WHIP_IMG  = os.path.join('data', 'picture', 'whip.png')
+_WHIP_IMG  = os.path.join('picture', 'whip.png')
 
 
 # ── 次數紀錄 ─────────────────────────────────────────────────────────────────

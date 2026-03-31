@@ -12,7 +12,7 @@ from config import MASTER_ID
 
 
 _ARTILLERY_FILE = os.path.join('data', 'artillery_records.json')
-_ARTILLERY_IMG  = os.path.join('data', 'picture', 'artillerylolicon.jpg')
+_ARTILLERY_IMG  = os.path.join('picture', 'artillerylolicon.jpg')
 
 
 def _load_artillery() -> dict:
@@ -36,7 +36,10 @@ def setup(tree: app_commands.CommandTree) -> None:
         guild   = interaction.guild
         channel = interaction.channel
         if guild is None or channel is None:
-            await interaction.response.send_message('此指令只能在伺服器中使用！', ephemeral=True)
+            await interaction.response.send_message(
+                embed=discord.Embed(description='此指令只能在伺服器中使用！', color=discord.Color.red()),
+                ephemeral=True
+            )
             return
 
         # ── 決定受害者 ──────────────────────────────────────────
@@ -55,7 +58,10 @@ def setup(tree: app_commands.CommandTree) -> None:
                 else [m for m in guild.members if not m.bot]
             )
             if not members:
-                await interaction.followup.send('找不到可砲擊的對象喵...', ephemeral=True)
+                await interaction.followup.send(
+                    embed=discord.Embed(description='找不到可砲擊的對象喵...', color=discord.Color.red()),
+                    ephemeral=True
+                )
                 return
             victim = random.choice(members)
 
@@ -69,15 +75,17 @@ def setup(tree: app_commands.CommandTree) -> None:
 
         # ── 回覆訊息 ────────────────────────────────────────────
         text = (
-            f'💀 今天的蘿莉控是 {victim.mention}（{victim.display_name}）！\n'
+            f'💀 今天的蘿莉控是 {victim.mention}！\n'
             f'（累計被炮決 **{count}** 次）'
         )
         send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
 
         if os.path.exists(_ARTILLERY_IMG):
-            await send(text, file=discord.File(_ARTILLERY_IMG))
+            embed = discord.Embed(description=text, color=discord.Color.dark_red())
+            embed.set_image(url='attachment://artillerylolicon.jpg')
+            await send(embed=embed, file=discord.File(_ARTILLERY_IMG, filename='artillerylolicon.jpg'))
         else:
-            await send(text)
+            await send(embed=discord.Embed(description=text, color=discord.Color.dark_red()))
 
     # ── 排行榜 ──────────────────────────────────────────────────
     @tree.command(name="炮決排行", description="查看本伺服器被炮決次數 TOP 10 排行榜💀")

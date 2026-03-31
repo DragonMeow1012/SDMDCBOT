@@ -249,27 +249,41 @@ def setup(tree: app_commands.CommandTree) -> None:
     async def slash_rel_map(interaction: discord.Interaction):
         guild = interaction.guild
         if not guild:
-            await interaction.response.send_message('此指令只能在伺服器中使用！', ephemeral=True)
+            await interaction.response.send_message(
+                embed=discord.Embed(description='此指令只能在伺服器中使用！', color=discord.Color.red()),
+                ephemeral=True
+            )
             return
 
         data = _load_rel()
         gid  = str(guild.id)
         rels = data.get(gid, {})
-        if not rels:
-            await interaction.response.send_message('本群還沒有任何主寵關係喵！', ephemeral=True)
+        from commands.wife import get_active_wife_rels
+        wife_rels = get_active_wife_rels(guild.id)
+        if not rels and not wife_rels:
+            await interaction.response.send_message(
+                embed=discord.Embed(description='本群還沒有任何關係紀錄喵！', color=discord.Color.red()),
+                ephemeral=True
+            )
             return
 
         await interaction.response.defer()
 
         try:
             from graph_render import render_relation_graph
-            from commands.wife import get_active_wife_rels
-            wife_rels = get_active_wife_rels(guild.id)
             buf = await render_relation_graph(guild, rels, wife_rels)
-            await interaction.followup.send(file=discord.File(buf, filename='relations.png'))
+            embed = discord.Embed(color=discord.Color.blurple())
+            embed.set_image(url='attachment://relations.png')
+            await interaction.followup.send(
+                embed=embed,
+                file=discord.File(buf, filename='relations.png')
+            )
         except Exception as e:
             print(f'[GRAPH] 圖形渲染失敗: {e}')
-            await interaction.followup.send(f'圖形渲染失敗喵：{e}', ephemeral=True)
+            await interaction.followup.send(
+                embed=discord.Embed(description=f'圖形渲染失敗喵：{e}', color=discord.Color.red()),
+                ephemeral=True
+            )
 
     @tree.command(name="賽博釣群友", description="放出釣魚按鈕，點下「咬鉤」的人會被 Webhook 偽裝發出一則訊息🪝")
     async def slash_fishing(interaction: discord.Interaction):
