@@ -307,13 +307,16 @@ def setup(tree: app_commands.CommandTree) -> None:
         result = random.choice(['🌕 **正面**', '🌑 **反面**'])
         lines = random.sample(_COIN_DRAMA, random.randint(1, 10))
 
-        await interaction.response.send_message(f'🪙 {lines[0]}')
+        content = f'🪙 {lines[0]}'
+        await interaction.response.send_message(content)
         for line in lines[1:]:
             await asyncio.sleep(random.uniform(1.2, 2.2))
-            await interaction.channel.send(line)
+            content += f'\n{line}'
+            await interaction.edit_original_response(content=content)
 
         await asyncio.sleep(random.uniform(1.2, 2.0))
-        await interaction.channel.send(f'硬幣落地！結果是⋯⋯ {result}！')
+        content += f'\n硬幣落地！結果是⋯⋯ {result}！'
+        await interaction.edit_original_response(content=content)
 
     @tree.command(name="roll", description="從 1~100 隨機抽一個數字")
     async def slash_roll(interaction: discord.Interaction):
@@ -326,3 +329,65 @@ def setup(tree: app_commands.CommandTree) -> None:
         n    = random.randint(1, 6)
         name = interaction.user.display_name
         await interaction.response.send_message(f'{name} 投到了 **{n}** 點！')
+
+    _TEAM_NUM_WORDS = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十']
+
+    class TeamView(discord.ui.View):
+        def __init__(self, n_teams: int):
+            super().__init__(timeout=30)
+            self.n_teams      = n_teams
+            self.participants: list[discord.Member] = []
+            self.joined_ids:   set[int]             = set()
+
+        @discord.ui.button(label='參與 ✋', style=discord.ButtonStyle.primary)
+        async def join(self, interaction: discord.Interaction, _btn: discord.ui.Button):
+            user = interaction.user
+            if user.id in self.joined_ids:
+                await interaction.response.send_message('你已經參與了喵！', ephemeral=True)
+                return
+            self.joined_ids.add(user.id)
+            self.participants.append(user)
+            names = ' '.join(m.display_name for m in self.participants)
+            await interaction.response.edit_message(
+                content=(
+                    f'🎮 **隊伍抽籤報名中！**\n'
+                    f'將分成 **{self.n_teams}** 隊，30 秒後自動抽籤。\n'
+                    f'目前參與（{len(self.participants)} 人）：{names}'
+                )
+            )
+
+    @tree.command(name="抽隊伍", description="開放報名，30 秒後隨機分配隊伍")
+    @app_commands.describe(隊伍數量="要分成幾隊（2～10）")
+    async def slash_team_draw(interaction: discord.Interaction,
+                              隊伍數量: app_commands.Range[int, 2, 10]):
+        view = TeamView(隊伍數量)
+        await interaction.response.send_message(
+            f'🎮 **隊伍抽籤報名中！**\n'
+            f'將分成 **{隊伍數量}** 隊，30 秒後自動抽籤。\n'
+            f'目前參與（0 人）：',
+            view=view,
+        )
+        await asyncio.sleep(30)
+        view.stop()
+
+        participants = view.participants
+        if not participants:
+            await interaction.edit_original_response(
+                content='沒有人參與喵QQ', view=None)
+            return
+
+        random.shuffle(participants)
+        teams: list[list[str]] = [[] for _ in range(隊伍數量)]
+        for i, m in enumerate(participants):
+            teams[i % 隊伍數量].append(m.display_name)
+
+        lines = []
+        for i, team in enumerate(teams):
+            if team:
+                num = _TEAM_NUM_WORDS[i] if i < len(_TEAM_NUM_WORDS) else str(i + 1)
+                lines.append(f'第{num}隊：{" ".join(team)}')
+
+        await interaction.edit_original_response(
+            content='🎮 **抽隊伍結果！**\n' + '\n'.join(lines),
+            view=None,
+        )

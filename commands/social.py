@@ -1,10 +1,46 @@
 """
-社交指令：/認養寵物、/認主人、/本群關係圖、/賽博釣群友
+社交指令：/認養寵物、/認主人、/本群關係圖、/賽博釣群友、/分隊伍
 """
+import asyncio
 import json
 import os
+import random
 import discord
 from discord import app_commands
+
+
+_CHINESE_NUMS = ['一','二','三','四','五','六','七','八','九','十',
+                 '十一','十二','十三','十四','十五','十六','十七','十八','十九','二十']
+
+def _team_name(n: int) -> str:
+    if 1 <= n <= len(_CHINESE_NUMS):
+        return f'第{_CHINESE_NUMS[n-1]}隊'
+    return f'第{n}隊'
+
+
+class TeamSignupView(discord.ui.View):
+    def __init__(self, num_teams: int):
+        super().__init__(timeout=None)
+        self.num_teams = num_teams
+        self.participants: list[discord.Member] = []
+        self.message: discord.Message | None = None
+
+    def _signup_content(self) -> str:
+        return (
+            f'**抽隊伍開始！** 共分 **{self.num_teams}** 隊\n'
+            f'請在 **30 秒內**按下按鈕報名參與！（目前 {len(self.participants)} 人）'
+        )
+
+    @discord.ui.button(label='參與', style=discord.ButtonStyle.primary)
+    async def join(self, interaction: discord.Interaction, _btn: discord.ui.Button):
+        user = interaction.user
+        if any(p.id == user.id for p in self.participants):
+            await interaction.response.send_message('你已經報名了喵！', ephemeral=True)
+            return
+        self.participants.append(user)
+        await interaction.response.defer()
+        if self.message:
+            await self.message.edit(content=self._signup_content())
 
 
 _REL_FILE = os.path.join('data', 'relationships.json')
@@ -240,3 +276,44 @@ def setup(tree: app_commands.CommandTree) -> None:
         view = FishingView()
         await interaction.response.send_message(
             '🎣 **賽博釣魚中...**\n', view=view)
+
+    @tree.command(name="分隊伍", description="開放報名 30 秒，時間到後隨機分配隊伍")
+    @app_commands.describe(隊伍數量="要分成幾隊（2～20）")
+    async def slash_split_teams(interaction: discord.Interaction, 隊伍數量: int):
+        if not 2 <= 隊伍數量 <= 20:
+            await interaction.response.send_message('隊伍數量請填 2 到 20 之間喵！', ephemeral=True)
+            return
+
+        view = TeamSignupView(隊伍數量)
+        await interaction.response.send_message(view._signup_content(), view=view)
+        msg = await interaction.original_response()
+        view.message = msg
+
+        await asyncio.sleep(30)
+        view.stop()
+
+        # disable button
+        for item in view.children:
+            item.disabled = True
+        await msg.edit(
+            content=f'**抽隊伍開始！** 共分 **{隊伍數量}** 隊\n報名已截止，共 {len(view.participants)} 人參與。',
+            view=view
+        )
+
+        if not view.participants:
+            await interaction.followup.send('沒有人報名喵⋯⋯')
+            return
+
+        members = view.participants[:]
+        random.shuffle(members)
+
+        teams: list[list[discord.Member]] = [[] for _ in range(隊伍數量)]
+        for i, member in enumerate(members):
+            teams[i % 隊伍數量].append(member)
+
+        lines = []
+        for i, team in enumerate(teams):
+            names = ' '.join(m.display_name for m in team) if team else '（無人）'
+            lines.append(f'**{_team_name(i + 1)}**：{names}')
+
+        await interaction.followup.send('**分隊結果如下！**\n' + '\n'.join(lines))
