@@ -235,7 +235,7 @@ def setup(tree: app_commands.CommandTree) -> None:
                 name="pixiv-crawler",
             )
             _crawl_thread.start()
-            await channel.send("Pixiv 全站爬取已啟動，log 將即時輸出在此頻道")
+            await interaction.response.send_message("Pixiv全站爬取已啟動", ephemeral=True)
 
     @tree.command(name="pixiv停止", description="停止 Pixiv 背景爬取")
     async def pixiv_stop(interaction: discord.Interaction):
