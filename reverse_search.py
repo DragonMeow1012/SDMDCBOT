@@ -15,7 +15,8 @@ from config import SAUCENAO_API_KEY
 
 _SAUCENAO_URL  = 'https://saucenao.com/search.php'
 _SOUTUBOT_BASE = 'https://soutubot.moe'
-_SIM_THRESHOLD = 80
+_SIM_THRESHOLD       = 80
+_SOUTU_SIM_THRESHOLD = 75
 
 _HEADERS = {
     'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
@@ -218,6 +219,7 @@ async def _soutubot_search(image_data: bytes, mime_type: str) -> list[dict]:
             # 連結固定用作品 URL（不含頁數）
             path      = subj
             url       = (base + path) if path else ''
+            sim = float(item.get('similarity', 0))
             results.append({
                 'engine':     'soutubot',
                 'source':     source,
@@ -225,7 +227,7 @@ async def _soutubot_search(image_data: bytes, mime_type: str) -> list[dict]:
                 'author':     '',
                 'page':       page,
                 'url':        url,
-                'similarity': 99.0,
+                'similarity': sim,
             })
         return results
 
@@ -283,12 +285,18 @@ async def reverse_image_search(image_data: bytes, mime_type: str) -> str:
             lines.append(_format_result(i, r))
         return '\n\n'.join(lines)
 
-    other_hits = [r for r in _hits(soutu) if r.get('page')]
-    if other_hits:
-        print(f'[RSEARCH] SauceNAO 無符合，soutubot 命中（含page）{len(other_hits)} 筆')
-        lines = [f'找到 {len(other_hits)} 筆相似度 ≥{_SIM_THRESHOLD}% 的結果：']
-        for i, r in enumerate(other_hits, 1):
+    soutu_hits = sorted(
+        [r for r in soutu if r['url']
+         and r['similarity'] >= _SOUTU_SIM_THRESHOLD
+         and r.get('page')],
+        key=lambda r: r['similarity'],
+        reverse=True,
+    )
+    if soutu_hits:
+        print(f'[RSEARCH] SauceNAO 無符合，soutubot 命中（含page）{len(soutu_hits)} 筆 ≥{_SOUTU_SIM_THRESHOLD}%')
+        lines = [f'找到 {len(soutu_hits)} 筆相似度 ≥{_SOUTU_SIM_THRESHOLD}% 的結果：']
+        for i, r in enumerate(soutu_hits, 1):
             lines.append(_format_result(i, r))
         return '\n\n'.join(lines)
 
-    return '找不到相似的資訊喵QQ'
+    return '找不到相關連結喵QQ'
