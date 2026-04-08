@@ -61,7 +61,8 @@
       "Bash(kill 481)",
       "Bash(kill 1035)",
       "Bash(python -c \"from PIL import Image; print\\(''Pillow OK''\\)\")",
-      "Read(//c/Windows/Fonts/**)"
+      "Read(//c/Windows/Fonts/**)",
+      "Read(//d/vsc/pixiv_x_Spider/**)"
     ]
   }
 }

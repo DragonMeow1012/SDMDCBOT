@@ -4,7 +4,7 @@ Commands 套件入口。
 """
 from discord import app_commands
 
-from commands import admin, nick, gag, fun, social, artillery, quote, search, kb, whip, wife
+from commands import admin, nick, gag, fun, social, artillery, quote, search, kb, whip, wife, pixiv
 
 
 def setup_all(tree: app_commands.CommandTree) -> None:
@@ -19,3 +19,4 @@ def setup_all(tree: app_commands.CommandTree) -> None:
     kb.setup(tree)
     whip.setup(tree)
     wife.setup(tree)
+    pixiv.setup(tree)

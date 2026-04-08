@@ -1,10 +1,12 @@
 """
-以圖搜圖模組：SauceNAO（優先）→ soutubot（fallback）
+以圖搜圖模組：本地 Pixiv（優先）→ SauceNAO → soutubot（fallback）
+- 本地 Pixiv FAISS 有 ≥85% cosine 相似度 → 只輸出本地結果
 - SauceNAO 有 ≥80% 且有連結 → 只輸出 SauceNAO 結果
-- 否則輸出 soutubot ≥80% 結果
+- 否則輸出 soutubot ≥75% 結果
 - 原始回傳全數寫入 log，不做任何篩選
 """
 import asyncio
+import io
 import os
 import tempfile
 import requests
@@ -13,10 +15,13 @@ from config import SAUCENAO_API_KEY
 
 # ── 常數 ────────────────────────────────────────────────────────────────────
 
+_PIXIV_LOCAL_THRESHOLD = 0.998   # cosine 相似度（FAISS IndexFlatIP，0~1）
+_PIXIV_LOCAL_TOP_K     = 1      # 最多回傳幾筆本地結果
+
 _SAUCENAO_URL  = 'https://saucenao.com/search.php'
 _SOUTUBOT_BASE = 'https://soutubot.moe'
 _SIM_THRESHOLD       = 80
-_SOUTU_SIM_THRESHOLD = 75
+_SOUTU_SIM_THRESHOLD = 50
 
 _HEADERS = {
     'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
@@ -238,6 +243,79 @@ async def _soutubot_search(image_data: bytes, mime_type: str) -> list[dict]:
         os.unlink(tmp.name)
 
 
+# ── 本地 Pixiv FAISS 搜尋 ─────────────────────────────────────────────────────
+
+async def _pixiv_local_search(image_data: bytes) -> list[dict]:
+    """
+    用上傳圖片的顏色直方圖在本地 FAISS 索引中搜尋相似作品。
+    回傳格式與其他引擎一致的 dict 列表，similarity 已換算為百分比。
+    """
+    try:
+        import numpy as np
+        from PIL import Image
+        import pixiv_feature as fe
+        import pixiv_database as db
+
+        # 提取查詢圖片的顏色直方圖
+        img = Image.open(io.BytesIO(image_data)).convert("RGB")
+        query_vec = fe.extract_color_histogram(img).reshape(1, -1).astype("float32")
+
+        # 載入 FAISS 索引
+        index, id_list = fe.load_faiss_index()
+        if index is None or not id_list:
+            print("[PIXIV_LOCAL] 索引尚未建立，跳過本地搜尋")
+            return []
+
+        k = min(_PIXIV_LOCAL_TOP_K, index.ntotal)
+        scores, indices = index.search(query_vec, k)
+
+        results = []
+        high_sim_results = []  # 收集 >90% 的結果用於log
+        for score, idx in zip(scores[0], indices[0]):
+            if idx < 0:
+                continue
+            sim = float(score)  # cosine similarity (0~1，已 L2 正規化)
+            sim_pct = round(sim * 100, 1)
+            if sim > 0.9:  # >90%
+                illust_id = id_list[idx]
+                row = db.get_artwork(illust_id)
+                if row:
+                    high_sim_results.append({
+                        'illust_id': illust_id,
+                        'title': row['title'],
+                        'author': row['user_name'],
+                        'similarity': sim_pct,
+                    })
+            if sim < _PIXIV_LOCAL_THRESHOLD:
+                continue
+            illust_id = id_list[idx]
+            row = db.get_artwork(illust_id)
+            if row is None:
+                continue
+            results.append({
+                'engine':     'Pixiv本地',
+                'source':     'pixiv',
+                'title':      row['title'],
+                'author':     row['user_name'],
+                'page':       '',
+                'url':        f'https://www.pixiv.net/artworks/{illust_id}',
+                'similarity': sim_pct,
+            })
+
+        # 輸出 >90% 的結果到log
+        if high_sim_results:
+            print(f"[PIXIV_LOCAL] >90% 結果：")
+            for res in high_sim_results:
+                print(f"  ID:{res['illust_id']} | {res['title']} | {res['author']} | {res['similarity']}%")
+
+        print(f"[PIXIV_LOCAL] 命中 {len(results)} 筆 ≥{_PIXIV_LOCAL_THRESHOLD*100:.0f}%")
+        return results
+
+    except Exception as e:
+        print(f"[PIXIV_LOCAL] 搜尋失敗: {e}")
+        return []
+
+
 # ── 格式化 ────────────────────────────────────────────────────────────────────
 
 def _format_result(i: int, r: dict) -> str:
@@ -260,9 +338,47 @@ def _format_result(i: int, r: dict) -> str:
 
 async def reverse_image_search(image_data: bytes, mime_type: str) -> str:
     """
-    1. SauceNAO 有 ≥80% 且有連結 → 只輸出 SauceNAO 結果
-    2. 否則 fallback 到 soutubot ≥80% 結果
+    1. 本地 Pixiv FAISS ≥99.8% → 優先輸出本地結果（最多1筆）
+    2. 如果本地結果有新刊或R-18標籤，追加 soutubot 結果
+    3. SauceNAO 有 ≥80% 且有連結 → 輸出 SauceNAO 結果
+    4. 否則 fallback 到 soutubot ≥50% 結果
     """
+    # ── 1. 本地 Pixiv 優先 ──
+    local_hits = await _pixiv_local_search(image_data)
+    if local_hits:
+        lines = ['本地資料庫搜尋結果：']
+        for i, r in enumerate(local_hits, 1):
+            lines.append(_format_result(i, r))
+
+        # 檢查標籤是否包含新刊、R-18 或 本/Cxxx 類標籤
+        append_soutu = False
+        if local_hits:
+            import pixiv_database as db
+            import json
+            illust_id = int(local_hits[0]['url'].split('/')[-1])
+            row = db.get_artwork(illust_id)
+            if row and row['tags']:
+                tags = json.loads(row['tags'])
+                if any(tag in ['新刊', 'R-18'] or tag.startswith('本') or (tag.startswith('C') and tag[1:].isdigit()) for tag in tags):
+                    append_soutu = True
+
+        if append_soutu:
+            # 執行 soutubot 搜尋並追加
+            soutu = await _soutubot_search(image_data, mime_type)
+            soutu_hits = sorted(
+                [r for r in soutu if r['url']
+                 and r['similarity'] >= _SOUTU_SIM_THRESHOLD
+                 and r.get('page')],
+                key=lambda r: r['similarity'],
+                reverse=True,
+            )
+            if soutu_hits:
+                for i, r in enumerate(soutu_hits[:3], len(local_hits) + 1):  # 從本地之後繼續編號
+                    lines.append(_format_result(i, r))
+
+        return '\n\n'.join(lines)
+
+    # ── 2 & 3. 外部搜尋（並行）──
     soutu, sauce = await asyncio.gather(
         _soutubot_search(image_data, mime_type),
         _saucenao_search(image_data, mime_type),
