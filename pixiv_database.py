@@ -69,8 +69,8 @@ def upsert_artwork(data: dict):
         conn.execute(sql, data)
 
 
-def upsert_features(illust_id: int, color_hist: np.ndarray, dominant_colors: list):
-    """儲存特徵向量"""
+def upsert_features(illust_id: int, phash_vec: np.ndarray, dominant_colors: list = []):
+    """儲存 pHash 特徵向量（8 bytes uint8）"""
     sql = """
         INSERT INTO features (illust_id, color_hist, dominant_colors)
         VALUES (?, ?, ?)
@@ -82,7 +82,7 @@ def upsert_features(illust_id: int, color_hist: np.ndarray, dominant_colors: lis
     with get_connection() as conn:
         conn.execute(sql, (
             illust_id,
-            color_hist.astype(np.float32).tobytes(),
+            phash_vec.astype(np.uint8).tobytes(),
             json.dumps(dominant_colors)
         ))
 
@@ -95,14 +95,17 @@ def get_artwork(illust_id: int) -> Optional[sqlite3.Row]:
 
 
 def get_all_features() -> list[tuple[int, np.ndarray]]:
-    """取得所有已提取特徵的作品，回傳 [(illust_id, color_hist_array), ...]"""
+    """取得所有已提取 pHash 特徵的作品，回傳 [(illust_id, phash_uint8_array), ...]"""
     with get_connection() as conn:
         rows = conn.execute(
             "SELECT illust_id, color_hist FROM features WHERE color_hist IS NOT NULL"
         ).fetchall()
     result = []
     for row in rows:
-        arr = np.frombuffer(row["color_hist"], dtype=np.float32).copy()
+        blob = row["color_hist"]
+        if len(blob) != 8:      # 跳過舊版 float32 資料（384 bytes）
+            continue
+        arr = np.frombuffer(blob, dtype=np.uint8).copy()
         result.append((row["illust_id"], arr))
     return result
 

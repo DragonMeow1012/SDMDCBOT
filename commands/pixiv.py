@@ -37,6 +37,41 @@ logger.setLevel(logging.INFO)
 _stop_event: threading.Event | None = None
 _crawl_thread: threading.Thread | None = None
 _log_handler: "_DiscordLogHandler | None" = None
+_restart_task: "asyncio.Task | None" = None
+
+_AUTO_RESTART_INTERVAL = 30 * 60   # 秒
+
+# 即時狀態訊息：[(discord.Interaction, asyncio.AbstractEventLoop), ...]
+_status_interactions: "list[tuple[discord.Interaction, asyncio.AbstractEventLoop]]" = []
+
+
+def _build_status_text() -> str:
+    try:
+        s = db.stats()
+    except Exception:
+        s = {"total": 0, "downloaded": 0, "indexed": 0}
+    status_str = "執行中" if _is_running() else "已停止"
+    return (
+        f"**Pixiv 爬取狀態：{status_str}**\n"
+        f"總作品數：{s['total']}\n"
+        f"已下載：{s['downloaded']}\n"
+        f"已建立索引：{s['indexed']}"
+    )
+
+
+def _dispatch_status_update(counters: dict) -> None:
+    """由爬蟲 asyncio loop 呼叫，將更新分派到 bot event loop"""
+    text = _build_status_text()
+    dead = []
+    for itr, loop in _status_interactions:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                itr.edit_original_response(content=text), loop
+            )
+        except Exception:
+            dead.append((itr, loop))
+    for item in dead:
+        _status_interactions.remove(item)
 
 
 # ──────────────────────────────────────────────
@@ -121,6 +156,35 @@ def _run_full(stop_event: threading.Event):
         crawler.run_full_crawl(stop_event)
     except Exception as e:
         logger.error(f"全站爬取異常: {e}")
+
+
+async def _auto_restart_loop(channel: discord.TextChannel):
+    """每 _AUTO_RESTART_INTERVAL 秒停止並重啟全站爬蟲"""
+    global _stop_event, _crawl_thread
+    try:
+        while True:
+            await asyncio.sleep(_AUTO_RESTART_INTERVAL)
+            if not _is_running():
+                return
+            logger.info("自動重啟：傳送停止訊號")
+            _stop_event.set()
+            # 等舊執行緒結束（最多60秒）
+            old_thread = _crawl_thread
+            if old_thread:
+                await asyncio.to_thread(old_thread.join, 60)
+            # 建立新執行緒
+            _stop_event = threading.Event()
+            _crawl_thread = threading.Thread(
+                target=_run_full,
+                args=(_stop_event,),
+                daemon=True,
+                name="pixiv-crawler",
+            )
+            _crawl_thread.start()
+            logger.info("爬蟲已自動重啟")
+            await channel.send("Pixiv 爬蟲已自動重啟（每30分鐘）")
+    except asyncio.CancelledError:
+        pass
 
 
 def _run_user(user_id: int, stop_event: threading.Event,
@@ -228,6 +292,7 @@ def setup(tree: app_commands.CommandTree) -> None:
             )
 
         else:
+            crawler.set_progress_hook(_dispatch_status_update, interval=5)
             _crawl_thread = threading.Thread(
                 target=_run_full,
                 args=(_stop_event,),
@@ -235,22 +300,34 @@ def setup(tree: app_commands.CommandTree) -> None:
                 name="pixiv-crawler",
             )
             _crawl_thread.start()
-            await interaction.response.send_message("Pixiv全站爬取已啟動", ephemeral=True)
+            _restart_task = asyncio.create_task(
+                _auto_restart_loop(channel)
+            )
+            await interaction.response.send_message(
+                "Pixiv全站爬取已啟動（每30分鐘自動重啟）", ephemeral=True
+            )
 
     @tree.command(name="pixiv停止", description="停止 Pixiv 背景爬取")
     async def pixiv_stop(interaction: discord.Interaction):
-        global _log_handler
+        global _log_handler, _restart_task
 
         if not _is_running():
             await interaction.response.send_message("目前沒有執行中的爬取", ephemeral=True)
             return
 
+        # 取消自動重啟
+        if _restart_task and not _restart_task.done():
+            _restart_task.cancel()
+            _restart_task = None
+
         _stop_event.set()
+        crawler.set_progress_hook(None)
         await interaction.response.send_message(
             "已傳送停止訊號，爬取將在當前批次完成後結束", ephemeral=True
         )
 
-        # 等執行緒結束後再移除 handler（最多等 10 秒）
+        loop = asyncio.get_event_loop()
+
         def _cleanup():
             global _log_handler
             if _crawl_thread:
@@ -258,22 +335,17 @@ def setup(tree: app_commands.CommandTree) -> None:
             if _log_handler:
                 _detach_log_handler(_log_handler)
                 _log_handler = None
+            # 最終狀態更新
+            _dispatch_status_update({})
+            _status_interactions.clear()
 
         threading.Thread(target=_cleanup, daemon=True).start()
 
-    @tree.command(name="pixiv狀態", description="查看 Pixiv 爬取狀態與統計")
+    @tree.command(name="pixiv狀態", description="查看 Pixiv 爬取狀態與統計（爬取中即時更新）")
     async def pixiv_status(interaction: discord.Interaction):
-        running = _is_running()
-        try:
+        text = _build_status_text()
+        await interaction.response.send_message(text, ephemeral=True)
+
+        if _is_running():
             loop = asyncio.get_event_loop()
-            s = await loop.run_in_executor(None, db.stats)
-            status_str = "執行中" if running else "已停止"
-            msg = (
-                f"**Pixiv 爬取狀態：{status_str}**\n"
-                f"總作品數：{s['total']}\n"
-                f"已下載：{s['downloaded']}\n"
-                f"已建立索引：{s['indexed']}"
-            )
-        except Exception as e:
-            msg = f"**Pixiv 爬取狀態：{'執行中' if running else '已停止'}**\n無法讀取統計：{e}"
-        await interaction.response.send_message(msg, ephemeral=True)
+            _status_interactions.append((interaction, loop))

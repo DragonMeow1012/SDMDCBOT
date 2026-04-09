@@ -42,9 +42,7 @@ MAX_IMAGE_SIZE = (1024, 1024)
 DOWNLOAD_WORKERS = 4
 
 # ===== 特徵提取設定 =====
-COLOR_BINS = 32
-COLOR_FEATURE_DIM = 32 * 3  # 96 維
-THUMB_SIZE = (224, 224)
+PHASH_BITS = 64          # pHash 位元數（8x8 DCT = 64 bits = 8 bytes）
 
 # ===== 代理設定（可選）=====
 PROXY = os.environ.get("HTTP_PROXY", None)

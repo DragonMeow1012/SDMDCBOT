@@ -1,8 +1,8 @@
 """
 以圖搜圖模組：本地 Pixiv（優先）→ SauceNAO → soutubot（fallback）
-- 本地 Pixiv FAISS 有 ≥85% cosine 相似度 → 只輸出本地結果
+- 本地 Pixiv FAISS pHash ≥95% → 只輸出本地結果
 - SauceNAO 有 ≥80% 且有連結 → 只輸出 SauceNAO 結果
-- 否則輸出 soutubot ≥75% 結果
+- 否則輸出 soutubot ≥50% 結果
 - 原始回傳全數寫入 log，不做任何篩選
 """
 import asyncio
@@ -15,7 +15,7 @@ from config import SAUCENAO_API_KEY
 
 # ── 常數 ────────────────────────────────────────────────────────────────────
 
-_PIXIV_LOCAL_THRESHOLD = 0.998   # cosine 相似度（FAISS IndexFlatIP，0~1）
+_PIXIV_LOCAL_THRESHOLD = 95.0    # pHash 相似度百分比（100 - Hamming/64*100）
 _PIXIV_LOCAL_TOP_K     = 1      # 最多回傳幾筆本地結果
 
 _SAUCENAO_URL  = 'https://saucenao.com/search.php'
@@ -247,8 +247,8 @@ async def _soutubot_search(image_data: bytes, mime_type: str) -> list[dict]:
 
 async def _pixiv_local_search(image_data: bytes) -> list[dict]:
     """
-    用上傳圖片的顏色直方圖在本地 FAISS 索引中搜尋相似作品。
-    回傳格式與其他引擎一致的 dict 列表，similarity 已換算為百分比。
+    用 pHash 在本地 FAISS 二值索引（Hamming 距離）搜尋相似作品。
+    similarity = (64 - hamming) / 64 * 100，閾值 _PIXIV_LOCAL_THRESHOLD（百分比）。
     """
     try:
         import numpy as np
@@ -256,37 +256,37 @@ async def _pixiv_local_search(image_data: bytes) -> list[dict]:
         import pixiv_feature as fe
         import pixiv_database as db
 
-        # 提取查詢圖片的顏色直方圖
+        # 提取查詢圖片的 pHash
         img = Image.open(io.BytesIO(image_data)).convert("RGB")
-        query_vec = fe.extract_color_histogram(img).reshape(1, -1).astype("float32")
+        query_vec = fe.extract_phash(img).reshape(1, -1).astype(np.uint8)
 
-        # 載入 FAISS 索引
+        # 載入 FAISS 二值索引
         index, id_list = fe.load_faiss_index()
         if index is None or not id_list:
             print("[PIXIV_LOCAL] 索引尚未建立，跳過本地搜尋")
             return []
 
         k = min(_PIXIV_LOCAL_TOP_K, index.ntotal)
-        scores, indices = index.search(query_vec, k)
+        distances, indices = index.search(query_vec, k)
 
+        _PHASH_BITS = 64
         results = []
-        high_sim_results = []  # 收集 >90% 的結果用於log
-        for score, idx in zip(scores[0], indices[0]):
+        high_sim_results = []
+        for hamming, idx in zip(distances[0], indices[0]):
             if idx < 0:
                 continue
-            sim = float(score)  # cosine similarity (0~1，已 L2 正規化)
-            sim_pct = round(sim * 100, 1)
-            if sim > 0.9:  # >90%
+            sim_pct = round((1.0 - hamming / _PHASH_BITS) * 100, 1)
+            if sim_pct >= 90.0:
                 illust_id = id_list[idx]
                 row = db.get_artwork(illust_id)
                 if row:
                     high_sim_results.append({
                         'illust_id': illust_id,
-                        'title': row['title'],
-                        'author': row['user_name'],
+                        'title':     row['title'],
+                        'author':    row['user_name'],
                         'similarity': sim_pct,
                     })
-            if sim < _PIXIV_LOCAL_THRESHOLD:
+            if sim_pct < _PIXIV_LOCAL_THRESHOLD:
                 continue
             illust_id = id_list[idx]
             row = db.get_artwork(illust_id)
@@ -302,13 +302,12 @@ async def _pixiv_local_search(image_data: bytes) -> list[dict]:
                 'similarity': sim_pct,
             })
 
-        # 輸出 >90% 的結果到log
         if high_sim_results:
-            print(f"[PIXIV_LOCAL] >90% 結果：")
+            print(f"[PIXIV_LOCAL] ≥90% 結果：")
             for res in high_sim_results:
                 print(f"  ID:{res['illust_id']} | {res['title']} | {res['author']} | {res['similarity']}%")
 
-        print(f"[PIXIV_LOCAL] 命中 {len(results)} 筆 ≥{_PIXIV_LOCAL_THRESHOLD*100:.0f}%")
+        print(f"[PIXIV_LOCAL] 命中 {len(results)} 筆 ≥{_PIXIV_LOCAL_THRESHOLD:.0f}%")
         return results
 
     except Exception as e:
