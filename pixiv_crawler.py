@@ -58,14 +58,20 @@ class _TokenBucket:
         self._rate_bytes = rate_mbps * 1024 * 1024 / 8  # bytes/sec
         self._tokens: float = self._rate_bytes
         self._last_refill: float = time.monotonic()
-        self._lock = asyncio.Lock()
+        self._lock: "asyncio.Lock | None" = None  # 懶初始化，確保在 event loop 內建立
+
+    def _get_lock(self) -> asyncio.Lock:
+        """第一次使用時在當前 event loop 內建立 Lock，避免 Python 3.10+ 跨 loop 錯誤。"""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     def update_rate(self, rate_mbps: float) -> None:
         self._rate_bytes = rate_mbps * 1024 * 1024 / 8
 
     async def consume(self, n_bytes: int) -> None:
         """消耗 n_bytes 個 token；不足時 sleep 等待補充。"""
-        async with self._lock:
+        async with self._get_lock():
             now = time.monotonic()
             elapsed = now - self._last_refill
             self._tokens = min(
@@ -273,15 +279,22 @@ def _extract_gallery_urls(illust: dict) -> list[str]:
 # 同步 API 抓取（交由 asyncio.to_thread 執行）
 # ──────────────────────────────────────────────
 
+def _iter_illusts(result: dict) -> list[dict]:
+    """從 API 結果提取有效插畫/漫畫，統一處理類型過濾。"""
+    return [
+        _parse_illust(i)
+        for i in result.get("illusts", [])
+        if i.get("type") in ("illust", "manga")
+    ]
+
+
 def _fetch_ranking(api: AppPixivAPI, mode: str) -> list[dict]:
     artworks, offset = [], 0
     while True:
         result = api.illust_ranking(mode=mode, offset=offset)
-        if not result or "illusts" not in result:
+        if not result or "illusts" not in result or not result["illusts"]:
             break
-        for illust in result["illusts"]:
-            if illust["type"] in ("illust", "manga"):
-                artworks.append(_parse_illust(illust))
+        artworks.extend(_iter_illusts(result))
         if not result.get("next_url"):
             break
         offset += 30
@@ -298,11 +311,9 @@ def _fetch_tag(api: AppPixivAPI, tag: str, sort: str = "popular_desc") -> list[d
             sort=sort,
             offset=offset,
         )
-        if not result or "illusts" not in result:
+        if not result or "illusts" not in result or not result["illusts"]:
             break
-        for illust in result["illusts"]:
-            if illust["type"] in ("illust", "manga"):
-                artworks.append(_parse_illust(illust))
+        artworks.extend(_iter_illusts(result))
         if not result.get("next_url"):
             break
         offset += 30
@@ -315,9 +326,9 @@ def _fetch_related(api: AppPixivAPI, illust_id: int) -> list[dict]:
     artworks: list[dict] = []
     result = api.illust_related(illust_id=illust_id)
     while result and "illusts" in result:
-        for illust in result["illusts"]:
-            if illust["type"] in ("illust", "manga"):
-                artworks.append(_parse_illust(illust))
+        if not result["illusts"]:
+            break
+        artworks.extend(_iter_illusts(result))
         next_url = result.get("next_url")
         if not next_url:
             break
@@ -335,11 +346,9 @@ def _fetch_user_artworks_sync(api: AppPixivAPI, user_id: int) -> list[dict]:
     offset = 0
     while True:
         result = api.user_illusts(user_id, type="illust", offset=offset)
-        if not result or "illusts" not in result:
+        if not result or "illusts" not in result or not result["illusts"]:
             break
-        for illust in result["illusts"]:
-            if illust["type"] in ("illust", "manga"):
-                artworks.append(_parse_illust(illust))
+        artworks.extend(_iter_illusts(result))
         if not result.get("next_url"):
             break
         offset += 30
@@ -351,11 +360,9 @@ def _fetch_recommended(api: AppPixivAPI) -> list[dict]:
     artworks, offset = [], 0
     while True:
         result = api.illust_recommended(offset=offset)
-        if not result or "illusts" not in result:
+        if not result or "illusts" not in result or not result["illusts"]:
             break
-        for illust in result["illusts"]:
-            if illust["type"] in ("illust", "manga"):
-                artworks.append(_parse_illust(illust))
+        artworks.extend(_iter_illusts(result))
         if not result.get("next_url"):
             break
         offset += 30
@@ -363,24 +370,66 @@ def _fetch_recommended(api: AppPixivAPI) -> list[dict]:
     return artworks
 
 
-async def _ensure_gallery_urls(api: AppPixivAPI, artwork: dict) -> list[str]:
+def _fetch_new_illusts(api: AppPixivAPI, content_type: str = "illust") -> list[dict]:
+    """抓取全站最新上傳作品（每輪前 NEW_ILLUSTS_MAX_PAGES 頁），作為擴散種子。"""
+    max_pages: int = getattr(config, "NEW_ILLUSTS_MAX_PAGES", 15)
+    artworks: list[dict] = []
+    try:
+        result = api.illust_new(content_type=content_type)
+    except Exception as e:
+        logger.warning(f"[新作品] illust_new({content_type}) 不支援或失敗: {e}")
+        return artworks
+    pages = 0
+    while result and "illusts" in result and pages < max_pages:
+        if not result["illusts"]:
+            break
+        artworks.extend(_iter_illusts(result))
+        next_url = result.get("next_url")
+        if not next_url:
+            break
+        time.sleep(config.FULL_CRAWL_API_DELAY)
+        try:
+            qs = api.parse_qs(next_url)
+            result = api.illust_new(**qs)
+        except Exception:
+            break
+        pages += 1
+    return artworks
+
+
+async def _ensure_gallery_urls(
+    api: AppPixivAPI,
+    artwork: dict,
+    api_sem: "asyncio.Semaphore | None" = None,
+) -> list[str]:
+    """確保多頁漫畫有完整 URL；透過 api_sem 限制並發 illust_detail 呼叫數量。"""
     page_count = int(artwork.get("page_count") or 1)
     cached_urls = [u for u in (artwork.get("gallery_urls") or []) if u]
     if page_count <= 1:
         return cached_urls or ([artwork.get("image_url")] if artwork.get("image_url") else [])
     if len(cached_urls) >= page_count:
         return cached_urls
-    try:
-        detail = await asyncio.to_thread(api.illust_detail, artwork["illust_id"])
-        illust = detail.get("illust") if detail else None
-        if illust:
-            urls = _extract_gallery_urls(illust)
-            if urls:
-                artwork["gallery_urls"] = urls
-                artwork["image_url"] = urls[0]
-                return urls
-    except Exception as e:
-        logger.warning(f"補抓圖集 URL 失敗 {artwork['illust_id']}: {e}")
+
+    for attempt in range(1, 4):  # 最多重試 3 次
+        try:
+            if api_sem:
+                async with api_sem:
+                    detail = await asyncio.to_thread(api.illust_detail, artwork["illust_id"])
+                    await asyncio.sleep(0.3)  # API 禮貌延遲
+            else:
+                detail = await asyncio.to_thread(api.illust_detail, artwork["illust_id"])
+            illust = detail.get("illust") if detail else None
+            if illust:
+                urls = _extract_gallery_urls(illust)
+                if urls:
+                    artwork["gallery_urls"] = urls
+                    artwork["image_url"] = urls[0]
+                    return urls
+        except Exception as e:
+            if attempt < 3:
+                await asyncio.sleep(1.5 * attempt)
+            else:
+                logger.warning(f"補抓圖集 URL 失敗 {artwork['illust_id']}: {e}")
     return cached_urls or ([artwork.get("image_url")] if artwork.get("image_url") else [])
 
 
@@ -403,11 +452,9 @@ async def _fetch_user_artworks(
         result = await asyncio.to_thread(
             api.user_illusts, user_id, type="illust", offset=offset
         )
-        if not result or "illusts" not in result:
+        if not result or "illusts" not in result or not result["illusts"]:
             break
-        for illust in result["illusts"]:
-            if illust["type"] in ("illust", "manga"):
-                artworks.append(_parse_illust(illust))
+        artworks.extend(_iter_illusts(result))
         if not result.get("next_url"):
             break
         offset += 30
@@ -428,20 +475,24 @@ async def _download_artwork_async(
     stop_event: threading.Event,
     counters: dict,
     on_success: "Callable[[dict], None] | None" = None,
+    api_sem: "asyncio.Semaphore | None" = None,
+    on_skip: "Callable[[dict], None] | None" = None,
 ) -> None:
     """Download one artwork, persist features, and emit progress updates."""
     if stop_event.is_set():
         return
 
     illust_id = artwork["illust_id"]
-    page_count = int(artwork.get("page_count") or 1)
 
     try:
         if _is_cached_fully_indexed(illust_id):
             counters["skipped"] += 1
+            # 跳過時只做輕量的作者發現（不加入 related_diff_q 以免爆炸性增長）
+            if on_skip:
+                on_skip(artwork)
             return
 
-        urls = await _ensure_gallery_urls(api, artwork)
+        urls = await _ensure_gallery_urls(api, artwork, api_sem)
         if not urls:
             counters["failed"] += 1
             return
@@ -449,6 +500,13 @@ async def _download_artwork_async(
         async with sem:
             page_features: list[tuple[int, str, object]] = []
             urls_to_fetch = urls[:config.MAX_GALLERY_PAGES]
+
+            def _compute_phash(raw: bytes) -> object:
+                """CPU-bound pHash 提取，交由執行緒池處理以釋放 GIL。"""
+                img = Image.open(io.BytesIO(raw)).convert("RGB")
+                img.thumbnail(config.MAX_IMAGE_SIZE, Image.LANCZOS)
+                return fe.extract_phash(img)
+
             for page_index, page_url in enumerate(urls_to_fetch):
                 page_success = False
                 last_error: Exception | None = None
@@ -456,7 +514,7 @@ async def _download_artwork_async(
                     try:
                         async with session.get(
                             page_url,
-                            timeout=aiohttp.ClientTimeout(total=60),
+                            timeout=aiohttp.ClientTimeout(total=90),
                         ) as resp:
                             resp.raise_for_status()
                             chunks: list[bytes] = []
@@ -468,9 +526,8 @@ async def _download_artwork_async(
                                 chunks.append(chunk)
                             data = b"".join(chunks)
 
-                        img = Image.open(io.BytesIO(data)).convert("RGB")
-                        img.thumbnail(config.MAX_IMAGE_SIZE, Image.LANCZOS)
-                        phash_vec = fe.extract_phash(img)
+                        # 在執行緒池計算 pHash，讓 event loop 可同時處理其他 I/O
+                        phash_vec = await asyncio.to_thread(_compute_phash, data)
                         page_features.append((page_index, page_url, phash_vec))
                         page_success = True
                         break
@@ -492,7 +549,7 @@ async def _download_artwork_async(
                 counters["failed"] += 1
                 return
 
-            def _process() -> None:
+            def _persist() -> None:
                 db.upsert_artwork(artwork)
                 first_phash = None
                 for page_index, page_url, phash_vec in page_features:
@@ -508,7 +565,7 @@ async def _download_artwork_async(
                 if first_phash is not None:
                     db.upsert_features(illust_id, first_phash)
 
-            await asyncio.to_thread(_process)
+            await asyncio.to_thread(_persist)
             _mark_artwork_fully_indexed(illust_id)
             counters["downloaded"] += 1
             logger.info(f"已處理 {illust_id} | {artwork['title'][:40]}")
@@ -535,6 +592,8 @@ async def _process_batch_async(
     status_callback: Callable | None = None,
     total_artworks: int | None = None,
     on_success: "Callable[[dict], None] | None" = None,
+    api_sem: "asyncio.Semaphore | None" = None,
+    on_skip: "Callable[[dict], None] | None" = None,
 ) -> None:
     """並行處理一批作品，全部完成後才回傳"""
     tasks = [
@@ -546,6 +605,8 @@ async def _process_batch_async(
             stop_event,
             counters,
             on_success=on_success,
+            api_sem=api_sem,
+            on_skip=on_skip,
         )
         for aw in artworks
     ]
@@ -567,6 +628,8 @@ async def _run_full_crawl_async(
 ) -> None:
     counters = {"downloaded": 0, "skipped": 0, "failed": 0, "round": 0}
     download_sem = asyncio.Semaphore(config.DOWNLOAD_WORKERS)
+    # illust_detail 專用 semaphore：限制並發 API 呼叫數，避免 rate limit
+    api_detail_sem = asyncio.Semaphore(getattr(config, "API_DETAIL_CONCURRENCY", 3))
 
     # ── 擴散佇列 ──────────────────────────────────────
     # visited_users：已排程爬全作品的 user_id（session 內去重）
@@ -580,7 +643,7 @@ async def _run_full_crawl_async(
     related_diff_q: asyncio.Queue[int] = asyncio.Queue()
 
     def _on_artwork_success(artwork: dict) -> None:
-        """下載成功後，把新作者和 illust_id 推入擴散佇列。"""
+        """新下載的作品：推入作者佇列 + 相關作品佇列（完整擴散）。"""
         uid = artwork.get("user_id")
         if uid and uid not in visited_users:
             visited_users.add(uid)
@@ -590,8 +653,18 @@ async def _run_full_crawl_async(
             related_visited.add(iid)
             related_diff_q.put_nowait(iid)
 
+    def _on_artwork_skip(artwork: dict) -> None:
+        """已索引的作品：只做作者發現，不加入 related_diff_q（避免爆炸性增長）。"""
+        uid = artwork.get("user_id")
+        if uid and uid not in visited_users:
+            visited_users.add(uid)
+            user_diff_q.put_nowait(uid)
+
     # ── 來源清單（種子）──────────────────────────────
     def _seed_sources():
+        # 全站最新上傳：捕捉新作者，擴散覆蓋率最高
+        yield _fetch_new_illusts, api, "illust"
+        yield _fetch_new_illusts, api, "manga"
         for mode in config.ALL_RANKING_MODES:
             yield _fetch_ranking, api, mode
         for tag in config.ALL_TAGS:
@@ -604,12 +677,22 @@ async def _run_full_crawl_async(
         current_round = counters["round"]
         logger.info(f"===== 第 {current_round} 輪開始 =====")
 
-        batch_queue: asyncio.Queue[list[dict] | None] = asyncio.Queue(maxsize=3)
-
-        connector = aiohttp.TCPConnector(limit=config.DOWNLOAD_WORKERS * 2, enable_cleanup_closed=True)
+        connector = aiohttp.TCPConnector(
+            limit=config.DOWNLOAD_WORKERS * 3,
+            enable_cleanup_closed=True,
+            ttl_dns_cache=300,
+        )
         dl_session = aiohttp.ClientSession(headers=dl_headers, connector=connector)
 
-        # ── 優先作者（外部插隊）───────────────────────
+        async def _process(artworks: list[dict]) -> None:
+            if artworks:
+                await _process_batch_async(
+                    api, dl_session, artworks, counters, stop_event, download_sem,
+                    on_success=_on_artwork_success,
+                    on_skip=_on_artwork_skip,
+                    api_sem=api_detail_sem,
+                )
+
         async def _drain_priority() -> None:
             while not stop_event.is_set():
                 priority_uid = _pop_priority_user()
@@ -630,6 +713,8 @@ async def _run_full_crawl_async(
                         await _process_batch_async(
                             api, dl_session, artworks, user_counters,
                             stop_event, download_sem, on_success=_on_artwork_success,
+                            on_skip=_on_artwork_skip,
+                            api_sem=api_detail_sem,
                         )
                     if stop_event.is_set():
                         status = "stopped"
@@ -643,11 +728,9 @@ async def _run_full_crawl_async(
                         "status": status,
                     })
 
-        # ── 擴散：消耗 user_diff_q / related_diff_q ──
         async def _drain_diffusion() -> None:
-            """把當前佇列裡所有待擴散的項目取出，以批次方式推入 batch_queue。"""
-            # 新作者 → 爬全作品
-            while not user_diff_q.empty() and not stop_event.is_set():
+            """直接處理擴散佇列中所有項目；優先插隊由 _priority_watcher 並行處理。"""
+            while not stop_event.is_set() and not user_diff_q.empty():
                 uid = user_diff_q.get_nowait()
                 try:
                     artworks = await asyncio.to_thread(_fetch_user_artworks_sync, api, uid)
@@ -655,10 +738,13 @@ async def _run_full_crawl_async(
                 except Exception as e:
                     logger.warning(f"[擴散-作者] 失敗 user={uid}: {e}")
                     artworks = []
-                if artworks:
-                    await batch_queue.put(artworks)
-            # 相關作品
-            while not related_diff_q.empty() and not stop_event.is_set():
+                await _process(artworks)
+                await _drain_related()
+
+            await _drain_related()
+
+        async def _drain_related() -> None:
+            while not stop_event.is_set() and not related_diff_q.empty():
                 iid = related_diff_q.get_nowait()
                 try:
                     artworks = await asyncio.to_thread(_fetch_related, api, iid)
@@ -666,11 +752,22 @@ async def _run_full_crawl_async(
                 except Exception as e:
                     logger.warning(f"[擴散-相關] 失敗 illust={iid}: {e}")
                     artworks = []
-                if artworks:
-                    await batch_queue.put(artworks)
+                await _process(artworks)
 
-        async def producer() -> None:
-            await _drain_priority()
+        async def _priority_watcher() -> None:
+            """
+            並行背景監視優先佇列。
+            asyncio 合作式排程：只要主流程到達任何 await 點（包含
+            asyncio.to_thread 等待期間），此 task 就能立即被排程執行，
+            不再受限於串行檢查點。
+            """
+            while not stop_event.is_set():
+                await _drain_priority()
+                await asyncio.sleep(2)  # 每 2 秒主動輪詢
+
+        # 啟動優先監視器（整個 round 含 60s 等待期間都有效）
+        _watcher_task = asyncio.create_task(_priority_watcher())
+        try:
             for fetch_fn, *args in _seed_sources():
                 if stop_event.is_set():
                     break
@@ -681,44 +778,31 @@ async def _run_full_crawl_async(
                 except Exception as e:
                     logger.warning(f"[種子] 來源失敗: {e}")
                     artworks = []
-                if artworks:
-                    await batch_queue.put(artworks)
-                # 每個種子來源後，立即消耗擴散佇列
-                await _drain_priority()
+                await _process(artworks)
                 await _drain_diffusion()
-            # 種子跑完後把剩餘擴散佇列清空
+            # 種子全跑完後把擴散佇列清空到底
             await _drain_diffusion()
-            await batch_queue.put(None)  # sentinel
 
-        async def consumer() -> None:
-            while True:
-                batch = await batch_queue.get()
-                if batch is None:
-                    break
-                if batch:
-                    await _process_batch_async(
-                        api, dl_session, batch, counters, stop_event, download_sem,
-                        on_success=_on_artwork_success,
-                    )
+            try:
+                s = db.stats()
+                logger.info(
+                    f"第 {current_round} 輪結束 | 新增 {counters['downloaded']} | "
+                    f"跳過 {counters['skipped']} | 失敗 {counters['failed']} | "
+                    f"DB {s['total']} 件 / 已索引 {s['indexed']} 件"
+                )
+            except Exception as e:
+                logger.warning(f"第 {current_round} 輪結束統計失敗: {e}")
 
-        try:
-            await asyncio.gather(producer(), consumer())
+            if not stop_event.is_set():
+                logger.info("等待 60 秒後開始下一輪...")
+                for _ in range(60):
+                    if stop_event.is_set():
+                        break
+                    await asyncio.sleep(1)
         finally:
+            _watcher_task.cancel()
+            await asyncio.gather(_watcher_task, return_exceptions=True)
             await dl_session.close()
-
-        s = db.stats()
-        logger.info(
-            f"第 {current_round} 輪結束 | 新增 {counters['downloaded']} | "
-            f"跳過 {counters['skipped']} | 失敗 {counters['failed']} | "
-            f"DB {s['total']} 件 / 已索引 {s['indexed']} 件"
-        )
-
-        if not stop_event.is_set():
-            logger.info("等待 60 秒後開始下一輪...")
-            for _ in range(60):
-                if stop_event.is_set():
-                    break
-                await asyncio.sleep(1)
 
     logger.info("爬取結束，存檔 FAISS 索引...")
     fe.flush_index()
@@ -793,12 +877,16 @@ async def _user_id_scan_async(
             return result
 
     download_sem = asyncio.Semaphore(config.DOWNLOAD_WORKERS)
-    connector = aiohttp.TCPConnector(
-        limit=config.DOWNLOAD_WORKERS * 2, enable_cleanup_closed=True
-    )
+    scan_api_detail_sem = asyncio.Semaphore(getattr(config, "API_DETAIL_CONCURRENCY", 3))
     counters = {"downloaded": 0, "skipped": 0, "failed": 0}
 
     async def worker(worker_id: int) -> None:
+        # 每個 worker 建立自己的 connector+session，避免共用 connector 被提早關閉
+        connector = aiohttp.TCPConnector(
+            limit=config.DOWNLOAD_WORKERS * 3,
+            enable_cleanup_closed=True,
+            ttl_dns_cache=300,
+        )
         async with aiohttp.ClientSession(headers=dl_headers, connector=connector) as session:
             while not stop_event.is_set():
                 uid = await _next_id()
@@ -835,6 +923,7 @@ async def _user_id_scan_async(
                     await _process_batch_async(
                         api, session, artworks, counters,
                         stop_event, download_sem, on_success=on_success,
+                        api_sem=scan_api_detail_sem,
                     )
 
         _save_scan_cursor(state["cursor"])
@@ -935,12 +1024,18 @@ async def _crawl_user_async(
 
     counters = {"downloaded": 0, "skipped": 0, "failed": 0}
     download_sem = asyncio.Semaphore(config.DOWNLOAD_WORKERS)
+    api_detail_sem = asyncio.Semaphore(getattr(config, "API_DETAIL_CONCURRENCY", 3))
 
-    connector = aiohttp.TCPConnector(limit=config.DOWNLOAD_WORKERS * 2, enable_cleanup_closed=True)
+    connector = aiohttp.TCPConnector(
+        limit=config.DOWNLOAD_WORKERS * 3,
+        enable_cleanup_closed=True,
+        ttl_dns_cache=300,
+    )
     async with aiohttp.ClientSession(headers=dl_headers, connector=connector) as session:
         await _process_batch_async(
             api, session, artworks, counters, stop_event, download_sem,
             status_callback=status_callback, total_artworks=total,
+            api_sem=api_detail_sem,
         )
 
     if status_callback:

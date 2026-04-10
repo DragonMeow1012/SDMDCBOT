@@ -50,16 +50,22 @@ ALL_TAGS = [
 FULL_CRAWL_API_DELAY = 1.0
 INDEX_REBUILD_INTERVAL = 500
 
-# tag 搜尋排序方向：先熱門再最新，盡量覆蓋全站
-CRAWL_TAG_SORTS = ["popular_desc", "date_desc"]
+# tag 搜尋排序方向：熱門→最新→最舊，盡量覆蓋全站（含歷史作品）
+CRAWL_TAG_SORTS = ["popular_desc", "date_desc", "date_asc"]
+
+# illust_new 種子：每輪從「全站最新上傳」抓的頁數（每頁 30 件）
+NEW_ILLUSTS_MAX_PAGES: int = 15
 
 # ===== 圖片下載設定 =====
 MAX_IMAGE_SIZE = (1024, 1024)
-DOWNLOAD_WORKERS = 4
+DOWNLOAD_WORKERS = 6           # 並行下載數（多核 I/O）
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_CHUNK_SIZE = 64 * 1024
 DOWNLOAD_RATE_LIMIT_Mbps = 120
 MAX_DOWNLOAD_RATE_LIMIT_Mbps = 120
+
+# illust_detail API 最大並發數（用於漫畫多頁 URL 補抓）
+API_DETAIL_CONCURRENCY: int = 3
 
 # ===== 特徵提取設定 =====
 PHASH_BITS = 64          # pHash 位元數（8x8 DCT = 64 bits = 8 bytes）
@@ -73,11 +79,11 @@ STATUS_WEB_PORT: int = int(os.environ.get("PIXIV_STATUS_PORT", "8766"))
 USER_ID_SCAN_ENABLED: bool = True
 # worker 數量：api_sem=1 讓所有 worker 序列化 user_detail，
 # 多 worker 只是讓下載/處理與下一個 user_detail 探測重疊（pipeline 效果）
-USER_ID_SCAN_WORKERS: int = 2
+USER_ID_SCAN_WORKERS: int = 3
 # 每次 user_detail API 呼叫後的強制等待（秒）
 # api_sem=1 下，實際速率 = 1 / USER_ID_SCAN_DELAY 次/秒
-# 加上主爬蟲同時也在發請求，建議 ≥ 2.0
-USER_ID_SCAN_DELAY: float = 2.0
+# 加上主爬蟲同時也在發請求，建議 ≥ 1.5
+USER_ID_SCAN_DELAY: float = 1.5
 USER_ID_SCAN_CURSOR_FILE: str = os.path.join(DATA_DIR, "user_id_scan_cursor.json")
 
 # ===== 代理設定（可選）=====

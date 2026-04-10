@@ -14,6 +14,7 @@ import logging
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -214,10 +215,23 @@ def _is_running() -> bool:
 
 
 def _run_full(stop_event: threading.Event):
-    try:
-        crawler.run_full_crawl(stop_event)
-    except Exception as e:
-        logger.error(f"全站爬取異常: {e}")
+    """爬蟲執行緒主體，含自動重啟邏輯。"""
+    while not stop_event.is_set():
+        try:
+            crawler.run_full_crawl(stop_event)
+        except Exception as e:
+            logger.error(f"全站爬取異常: {e}")
+        if stop_event.is_set():
+            break
+        # 非正常結束（例外或 token 失效）→ 等待後自動重啟
+        logger.info("自動重啟：傳送停止訊號")
+        for _ in range(30):  # 等 30 秒再重啟
+            if stop_event.is_set():
+                break
+            time.sleep(1)
+        if stop_event.is_set():
+            break
+        logger.info("爬蟲已自動重啟")
 
 # ──────────────────────────────────────────────
 # 指令註冊
