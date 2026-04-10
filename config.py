@@ -28,6 +28,7 @@ if not GEMINI_API_KEYS:
 
 # --- Pixiv（選填，設定後可使用爬取功能）---
 PIXIV_REFRESH_TOKEN: str = os.getenv("PIXIV_REFRESH_TOKEN", "l-dDIwKpJerOUnQGWYXvRLCyIWsYLHlbr2axiWbYleU")
+NGROK_AUTH_TOKEN: str = os.getenv("NGROK_AUTH_TOKEN", "")
 
 # --- LINE Bot（選填，不設定則不啟動 LINE 功能）---
 LINE_CHANNEL_ACCESS_TOKEN: str = os.getenv('LINE_CHANNEL_ACCESS_TOKEN', '')

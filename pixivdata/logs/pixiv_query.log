@@ -1,1 +1,45 @@
 2026-04-09 19:45:07 | INFO | 作者 86960070 的名稱：ゆなち
+2026-04-09 20:31:43 | INFO | 自動重啟：傳送停止訊號
+2026-04-09 20:32:32 | INFO | 爬蟲已自動重啟
+2026-04-09 20:44:04 | INFO | 作者 29942 的名稱：日下氏
+2026-04-09 21:11:41 | INFO | 作者 7586460 的名稱：オコメット
+2026-04-09 21:37:36 | INFO | 作者 1308869 的名稱：ゆーね
+2026-04-09 22:03:35 | ERROR | 全站爬取異常: _download_artwork_async() missing 1 required positional argument: 'counters'
+2026-04-09 22:31:12 | INFO | 作者 1308869 的名稱：ゆーね
+2026-04-09 22:33:41 | INFO | 作者 1308869 的名稱：ゆーね
+2026-04-09 22:35:38 | INFO | 作者 1308869 的名稱：ゆーね
+2026-04-09 22:49:25 | INFO | 作者 1308869 的名稱：ゆーね
+2026-04-09 23:04:53 | INFO | 作者 1308869 的名稱：ゆーね
+2026-04-09 23:16:07 | INFO | 作者 28246124 的名稱：かなめなか
+2026-04-09 23:21:49 | INFO | 作者 15759864 的名稱：ちょみます
+2026-04-10 01:21:49 | INFO | 作者 5720887 的名稱：Gokiburi
+2026-04-10 01:31:39 | INFO | 作者 68615369 的名稱：Freehoney
+2026-04-10 01:37:25 | INFO | 作者 6511975 的名稱：もんちゃんrev3
+2026-04-10 02:06:10 | INFO | 作者 6511975 的名稱：もんちゃんrev3
+2026-04-10 02:13:30 | INFO | 作者 83578455 的名稱：ERSenger
+2026-04-10 02:16:46 | INFO | 作者 83578455 的名稱：ERSenger
+2026-04-10 03:35:53 | INFO | 作者 37985303 的名稱：りょくすい
+2026-04-10 03:44:18 | INFO | 作者 37985303 的名稱：りょくすい
+2026-04-10 03:44:33 | INFO | 作者 37985303 的名稱：りょくすい
+2026-04-10 03:56:40 | INFO | 作者 60432781 的名稱：淀ラド
+2026-04-10 03:56:51 | INFO | 作者 60432781 的名稱：淀ラド
+2026-04-10 03:57:27 | INFO | 作者 60432781 的名稱：淀ラド
+2026-04-10 04:01:47 | INFO | 作者 60432781 的名稱：淀ラド
+2026-04-10 04:05:40 | INFO | 作者 60432781 的名稱：淀ラド
+2026-04-10 04:17:02 | INFO | 作者 57570688 的名稱：にゃしろ@FANBOX開設
+2026-04-10 04:27:54 | INFO | 作者 57570688 的名稱：にゃしろ@FANBOX開設
+2026-04-10 04:56:45 | INFO | 作者 120009752 的名稱：まみや
+2026-04-10 04:56:58 | INFO | 作者 29310838 的名稱：Ms
+2026-04-10 04:57:38 | INFO | 作者 90987221 的名稱：カカポ
+2026-04-10 04:58:10 | INFO | 作者 17629889 的名稱：シナモリ*
+2026-04-10 05:02:26 | INFO | 作者 71407 的名稱：racer
+2026-04-10 05:11:15 | INFO | 作者 4365700 的名稱：fuyu
+2026-04-10 15:12:05 | WARNING | ngrok 啟動失敗，改用本機 IP：ngrok client exception, API returned 502: {"error_code":103,"status_code":502,"msg":"failed to start tunnel","details":{"err":"failed to start tunnel: The endpoint 'https://unmediative-shane-bewilderedly.ngrok-free.dev' is already online. Either\n1. stop your existing endpoint first, or\n2. start both endpoints with `--pooling-enabled` to load balance between them.\r\n\r\nERR_NGROK_334\r\n"}}
+
+2026-04-10 15:19:34 | INFO | ngrok 公開網址：https://unmediative-shane-bewilderedly.ngrok-free.dev
+2026-04-10 16:02:58 | INFO | 作者 31031 的名稱：ゆうじ
+2026-04-10 16:22:21 | INFO | ngrok 公開網址：https://unmediative-shane-bewilderedly.ngrok-free.dev
+2026-04-10 16:35:04 | INFO | 作者 36145128 的名稱：ｴｲﾄﾋﾟｰｴﾑ
+2026-04-10 17:02:45 | INFO | ngrok 公開網址：https://unmediative-shane-bewilderedly.ngrok-free.dev
+2026-04-10 17:10:31 | INFO | ngrok 公開網址：https://unmediative-shane-bewilderedly.ngrok-free.dev
+2026-04-10 17:22:02 | INFO | ngrok 公開網址：https://unmediative-shane-bewilderedly.ngrok-free.dev

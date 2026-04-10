@@ -1,6 +1,6 @@
 """
-今日老婆指令：/抽今日老婆、/和今日老婆離婚
-老婆關係維持 24 小時後自動失效。
+今日媽媽指令：/抽今日媽媽、/和今日媽媽斷絕關係
+媽媽關係維持 24 小時後自動失效。
 """
 import asyncio
 import io
@@ -59,7 +59,7 @@ def _purge_expired(data: dict) -> dict:
 
 def get_active_wife_rels(guild_id: int) -> dict[str, str]:
     """
-    回傳目前有效的老婆關係 {husband_id: wife_id}，供關係圖使用。
+    回傳目前有效的媽媽關係 {child_id: mom_id}，供關係圖使用。
     """
     data   = _purge_expired(_load_wife())
     gid    = str(guild_id)
@@ -72,7 +72,7 @@ def get_active_wife_rels(guild_id: int) -> dict[str, str]:
 
 def setup(tree: app_commands.CommandTree) -> None:
 
-    @tree.command(name="抽今日老婆", description="從本群隨機抽一位成員作為你的老婆（當日只會抽一次）💕")
+    @tree.command(name="抽今日媽媽", description="從本群隨機抽一位成員作為你的媽媽（當日只會抽一次）💕")
     async def slash_draw_wife(interaction: discord.Interaction):
         guild = interaction.guild
         if guild is None:
@@ -145,7 +145,7 @@ def setup(tree: app_commands.CommandTree) -> None:
         else:
             avatar_bytes = None
 
-        text = f'你今天的老婆是：**{name}**\n要好好對待她哦{_LOVE_EMOJI}'
+        text = f'你今天的媽媽是：**{name}**\n要好好對待她哦{_LOVE_EMOJI}'
         embed = discord.Embed(description=text, color=discord.Color.pink())
         if avatar_bytes:
             await interaction.followup.send(
@@ -155,8 +155,8 @@ def setup(tree: app_commands.CommandTree) -> None:
         else:
             await interaction.followup.send(embed=embed)
 
-    @tree.command(name="強娶老婆", description="強制指定一位成員作為你的老婆，取代原有老婆")
-    @app_commands.describe(用戶="要強娶的對象")
+    @tree.command(name="認媽媽", description="強制指定一位成員作為你的媽媽，取代原有媽媽")
+    @app_commands.describe(用戶="要認的對象")
     async def slash_force_wife(interaction: discord.Interaction, 用戶: discord.Member):
         guild = interaction.guild
         if guild is None:
@@ -167,13 +167,13 @@ def setup(tree: app_commands.CommandTree) -> None:
             return
         if 用戶.bot:
             await interaction.response.send_message(
-                embed=discord.Embed(description='不能強娶 Bot 喵！', color=discord.Color.red()),
+                embed=discord.Embed(description='不能認 Bot 當媽媽喵！', color=discord.Color.red()),
                 ephemeral=True
             )
             return
         if 用戶.id == interaction.user.id:
             await interaction.response.send_message(
-                embed=discord.Embed(description='不能娶自己喵！', color=discord.Color.red()),
+                embed=discord.Embed(description='不能認自己當媽媽喵！', color=discord.Color.red()),
                 ephemeral=True
             )
             return
@@ -187,13 +187,13 @@ def setup(tree: app_commands.CommandTree) -> None:
         }
         _save_wife(data)
 
-        text = f' {interaction.user.mention} 強娶了 {用戶.mention} 作為老婆！{_LOVE_EMOJI}'
+        text = f'{interaction.user.mention} 認了 {用戶.mention} 作為媽媽！{_LOVE_EMOJI}'
         await interaction.response.send_message(
             embed=discord.Embed(description=text, color=discord.Color.pink())
         )
 
-    @tree.command(name="拋棄婚約", description="解除指定用戶對你的婚姻關係💔")
-    @app_commands.describe(用戶="要拋棄的對象")
+    @tree.command(name="拋棄兒子", description="解除指定用戶認你為媽媽的母子關係💔")
+    @app_commands.describe(用戶="要斷絕關係的孩子")
     async def slash_abandon_wife(interaction: discord.Interaction, 用戶: discord.Member):
         gid    = str(interaction.guild_id)
         uid    = str(用戶.id)
@@ -203,19 +203,19 @@ def setup(tree: app_commands.CommandTree) -> None:
         rec = data.get(gid, {}).get(uid)
         if rec is None or rec.get('wife_id') != my_id:
             await interaction.response.send_message(
-                embed=discord.Embed(description='對方跟你沒有婚姻關係喵！', color=discord.Color.red()),
+                embed=discord.Embed(description='對方沒有認你為媽媽喵！', color=discord.Color.red()),
                 ephemeral=True
             )
             return
 
         data[gid].pop(uid)
         _save_wife(data)
-        text = f'{interaction.user.mention} 跟 {用戶.mention} 離婚了<:crycat:1486308949173997730>'
+        text = f'{interaction.user.mention} 與 {用戶.mention} 斷絕了母子關係<:crycat:1486308949173997730>'
         await interaction.response.send_message(
             embed=discord.Embed(description=text, color=discord.Color.red())
         )
 
-    @tree.command(name="和今日老婆離婚", description="與目前的老婆離婚💔")
+    @tree.command(name="和今日媽媽斷絕關係", description="與今日抽到的媽媽斷絕母子關係💔")
     async def slash_divorce(interaction: discord.Interaction):
         gid  = str(interaction.guild_id)
         uid  = str(interaction.user.id)
@@ -223,7 +223,7 @@ def setup(tree: app_commands.CommandTree) -> None:
 
         if uid not in data.get(gid, {}):
             await interaction.response.send_message(
-                embed=discord.Embed(description='你目前沒有老婆喵！', color=discord.Color.red()),
+                embed=discord.Embed(description='你目前沒有媽媽喵！', color=discord.Color.red()),
                 ephemeral=True
             )
             return
@@ -243,7 +243,7 @@ def setup(tree: app_commands.CommandTree) -> None:
                 wife_name = member.display_name
         await interaction.response.send_message(
             embed=discord.Embed(
-                description=f'你已和{wife_name}離婚了<:crycat:1486308949173997730>',
+                description=f'你已和{wife_name}斷絕母子關係了<:crycat:1486308949173997730>',
                 color=discord.Color.red()
             )
         )

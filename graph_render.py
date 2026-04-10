@@ -105,7 +105,7 @@ async def render_relation_graph(
     wife_rels: dict[str, str] | None = None,  # {husband_id: wife_id}
 ) -> io.BytesIO:
     """
-    生成主寵 + 老婆關係視覺圖並回傳 PNG BytesIO。
+    生成主寵 + 媽媽關係視覺圖並回傳 PNG BytesIO。
     rels 結構：{pet_id: master_id}，箭頭方向 master → pet。
     wife_rels 結構：{husband_id: wife_id}，箭頭方向 husband → wife。
     """
@@ -151,7 +151,7 @@ async def render_relation_graph(
         shrink  = NODE_R / dist
         kind    = edata.get('kind', 'pet')
         color   = '#F4A0B8' if kind == 'wife' else '#A8C8E8'
-        label   = '我婆'    if kind == 'wife' else '寵物'
+        label   = '我媽'    if kind == 'wife' else '寵物'
 
         ax.annotate(
             '', zorder=2,
@@ -198,7 +198,7 @@ async def render_relation_graph(
         if pet_masters:
             parts.append(f'{"和".join(pet_masters)}的寵物')
         if husbands:
-            parts.append(f'{"和".join(husbands)}的老婆')
+            parts.append(f'{"和".join(husbands)}的媽媽')
         sub = f'({"、".join(parts)})' if parts else ''
 
         ax.text(

@@ -9,16 +9,21 @@ Pixiv 爬取指令模組
   - Pixiv 作者的 user ID（數字）
 """
 import asyncio
+import json
 import logging
+import subprocess
+import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 
 import discord
 from discord import app_commands
 
-from config import MASTER_ID
+from config import MASTER_ID, NGROK_AUTH_TOKEN
 import pixiv_database as db
 import pixiv_crawler as crawler
+from pixiv_config import STATUS_WEB_PORT
 
 # 設定 Pixiv 查詢日誌
 LOG_DIR = Path("pixivdata/logs")
@@ -36,111 +41,168 @@ logger.setLevel(logging.INFO)
 
 _stop_event: threading.Event | None = None
 _crawl_thread: threading.Thread | None = None
-_log_handler: "_DiscordLogHandler | None" = None
-_restart_task: "asyncio.Task | None" = None
 
-_AUTO_RESTART_INTERVAL = 30 * 60   # 秒
+_last_status_counters: dict = {}
+_priority_notice_requests: "dict[int, list[tuple[discord.Interaction, asyncio.AbstractEventLoop, str]]]" = {}
+_status_proc: "subprocess.Popen | None" = None
+_status_public_url: str = ""
 
-# 即時狀態訊息：[(discord.Interaction, asyncio.AbstractEventLoop), ...]
-_status_interactions: "list[tuple[discord.Interaction, asyncio.AbstractEventLoop]]" = []
+STATUS_JSON = Path("pixivdata/data/status.json")
+_STREAMLIT_PORT = STATUS_WEB_PORT
+
+
+def _write_status_json() -> None:
+    try:
+        s = db.stats()
+    except Exception:
+        s = {"total": 0, "downloaded": 0, "indexed": 0}
+
+    data: dict = {
+        "running": _is_running(),
+        "total": s["total"],
+        "downloaded": s["downloaded"],
+        "indexed": s["indexed"],
+        "priority_queue": crawler.get_priority_queue_size() or None,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if _last_status_counters:
+        data["round_downloaded"] = _last_status_counters.get("downloaded", 0)
+        data["round_skipped"]    = _last_status_counters.get("skipped", 0)
+        data["round_failed"]     = _last_status_counters.get("failed", 0)
+        if "round" in _last_status_counters:
+            data["round"] = _last_status_counters["round"]
+
+    STATUS_JSON.parent.mkdir(parents=True, exist_ok=True)
+    STATUS_JSON.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+async def _ensure_status_web_server() -> None:
+    global _status_proc, _status_public_url
+    if _status_proc is not None and _status_proc.poll() is None:
+        return
+
+    _write_status_json()
+
+    app_path = Path(__file__).parent.parent / "pixiv_status_app.py"
+    _status_proc = subprocess.Popen(
+        [sys.executable, "-m", "streamlit", "run", str(app_path),
+         "--server.port", str(_STREAMLIT_PORT),
+         "--server.headless", "true",
+         "--server.address", "0.0.0.0"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    await asyncio.sleep(3)  # 等 Streamlit 啟動
+
+    if NGROK_AUTH_TOKEN:
+        try:
+            from pyngrok import ngrok, conf
+            conf.get_default().auth_token = NGROK_AUTH_TOKEN
+            tunnel = await asyncio.to_thread(ngrok.connect, _STREAMLIT_PORT, "http")
+            _status_public_url = tunnel.public_url
+            logger.info(f"ngrok 公開網址：{_status_public_url}")
+        except Exception as e:
+            logger.warning(f"ngrok 啟動失敗：{e}")
+
+    if not _status_public_url:
+        _status_public_url = f"http://localhost:{_STREAMLIT_PORT}/"
 
 
 def _build_status_text() -> str:
     try:
         s = db.stats()
     except Exception:
-        s = {"total": 0, "downloaded": 0, "indexed": 0}
+        s = {"total": 0, "downloaded": 0, "indexed": 0, "gallery_pages": 0}
+
     status_str = "執行中" if _is_running() else "已停止"
-    return (
-        f"**Pixiv 爬取狀態：{status_str}**\n"
-        f"總作品數：{s['total']}\n"
-        f"已下載：{s['downloaded']}\n"
-        f"已建立索引：{s['indexed']}"
-    )
+    lines = [
+        f"**Pixiv 爬取狀態：{status_str}**",
+        f"作品總數：{s['total']}",
+        f"已下載：{s['downloaded']}",
+        f"已建立索引：{s['indexed']}",
+    ]
+    priority_queue_size = crawler.get_priority_queue_size()
+    if priority_queue_size:
+        lines.append(f"優先作者佇列：{priority_queue_size}")
+
+    if _last_status_counters:
+        lines.append(
+            "本輪進度："
+            f"新增 {_last_status_counters.get('downloaded', 0)} / "
+            f"跳過 {_last_status_counters.get('skipped', 0)} / "
+            f"失敗 {_last_status_counters.get('failed', 0)}"
+        )
+        if "round" in _last_status_counters:
+            lines.append(f"輪次：{_last_status_counters['round']}")
+
+    return "\n".join(lines)
 
 
 def _dispatch_status_update(counters: dict) -> None:
-    """由爬蟲 asyncio loop 呼叫，將更新分派到 bot event loop"""
-    text = _build_status_text()
-    dead = []
-    for itr, loop in _status_interactions:
-        try:
-            asyncio.run_coroutine_threadsafe(
-                itr.edit_original_response(content=text), loop
-            )
-        except Exception:
-            dead.append((itr, loop))
-    for item in dead:
-        _status_interactions.remove(item)
+    global _last_status_counters
+    if counters:
+        _last_status_counters = dict(counters)
+        _write_status_json()
 
 
-# ──────────────────────────────────────────────
-# Discord 即時 Log Handler
-# ──────────────────────────────────────────────
 
-class _DiscordLogHandler(logging.Handler):
-    """
-    攔截 pixiv_crawler / pixiv_feature 的 log，每 3 秒批次傳送到 Discord 頻道。
-    """
-    _FLUSH_INTERVAL = 3.0   # 秒
-    _MAX_LINES      = 25    # 每次最多傳幾行
+def _register_priority_notice(
+    user_id: int,
+    interaction: discord.Interaction,
+    loop: asyncio.AbstractEventLoop,
+    author_label: str,
+) -> None:
+    requests = _priority_notice_requests.setdefault(user_id, [])
+    requests.append((interaction, loop, author_label))
 
-    def __init__(self, channel: discord.TextChannel,
-                 loop: asyncio.AbstractEventLoop):
-        super().__init__()
-        self._channel = channel
-        self._loop    = loop
-        self._buf: list[str] = []
-        self._lock  = threading.Lock()
-        self._timer: threading.Timer | None = None
-        self.setFormatter(logging.Formatter("%(levelname)s | %(message)s"))
 
-    def emit(self, record: logging.LogRecord):
-        line = self.format(record)
-        with self._lock:
-            self._buf.append(line)
-            if self._timer is None or not self._timer.is_alive():
-                self._timer = threading.Timer(self._FLUSH_INTERVAL, self._flush)
-                self._timer.daemon = True
-                self._timer.start()
+def _clear_priority_notices() -> None:
+    _priority_notice_requests.clear()
 
-    def _flush(self):
-        with self._lock:
-            if not self._buf:
-                return
-            lines, self._buf = self._buf[:self._MAX_LINES], self._buf[self._MAX_LINES:]
-            has_more = bool(self._buf)
 
-        text = "```\n" + "\n".join(lines) + "\n```"
-        asyncio.run_coroutine_threadsafe(
-            self._channel.send(text), self._loop
+async def _send_priority_done_notice(
+    interaction: discord.Interaction,
+    author_label: str,
+    event: dict,
+) -> None:
+    status = event.get("status", "completed")
+    if status == "error":
+        text = f"作者 {author_label}（{event['user_id']}）的優先爬取失敗，請稍後再試。"
+    elif status == "stopped":
+        text = f"作者 {author_label}（{event['user_id']}）的優先爬取因停止指令而中斷。"
+    else:
+        text = (
+            f"作者 {author_label}（{event['user_id']}）已爬取完成。\n"
+            f"總作品：{event.get('total', 0)}\n"
+            f"新增：{event.get('downloaded', 0)}\n"
+            f"跳過：{event.get('skipped', 0)}\n"
+            f"失敗：{event.get('failed', 0)}"
         )
 
-        if has_more:
-            with self._lock:
-                self._timer = threading.Timer(0.5, self._flush)
-                self._timer.daemon = True
-                self._timer.start()
+    try:
+        await interaction.followup.send(text, ephemeral=True)
+        return
+    except Exception:
+        pass
 
-    def close(self):
-        if self._timer and self._timer.is_alive():
-            self._timer.cancel()
-        self._flush()
-        super().close()
-
-
-def _attach_log_handler(channel: discord.TextChannel,
-                        loop: asyncio.AbstractEventLoop) -> "_DiscordLogHandler":
-    handler = _DiscordLogHandler(channel, loop)
-    logging.getLogger("pixiv_crawler").addHandler(handler)
-    logging.getLogger("pixiv_feature").addHandler(handler)
-    return handler
+    try:
+        await interaction.user.send(text)
+    except Exception as e:
+        logger.warning(f"優先作者完成通知失敗 {event.get('user_id')}: {e}")
 
 
-def _detach_log_handler(handler: "_DiscordLogHandler"):
-    logging.getLogger("pixiv_crawler").removeHandler(handler)
-    logging.getLogger("pixiv_feature").removeHandler(handler)
-    handler.close()
+def _dispatch_priority_done(event: dict) -> None:
+    user_id = int(event["user_id"])
+    requests = _priority_notice_requests.pop(user_id, [])
+    for interaction, loop, author_label in requests:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _send_priority_done_notice(interaction, author_label, event),
+                loop,
+            )
+        except Exception as e:
+            logger.warning(f"派送優先作者完成通知失敗 {user_id}: {e}")
+
 
 
 # ──────────────────────────────────────────────
@@ -157,45 +219,6 @@ def _run_full(stop_event: threading.Event):
     except Exception as e:
         logger.error(f"全站爬取異常: {e}")
 
-
-async def _auto_restart_loop(channel: discord.TextChannel):
-    """每 _AUTO_RESTART_INTERVAL 秒停止並重啟全站爬蟲"""
-    global _stop_event, _crawl_thread
-    try:
-        while True:
-            await asyncio.sleep(_AUTO_RESTART_INTERVAL)
-            if not _is_running():
-                return
-            logger.info("自動重啟：傳送停止訊號")
-            _stop_event.set()
-            # 等舊執行緒結束（最多60秒）
-            old_thread = _crawl_thread
-            if old_thread:
-                await asyncio.to_thread(old_thread.join, 60)
-            # 建立新執行緒
-            _stop_event = threading.Event()
-            _crawl_thread = threading.Thread(
-                target=_run_full,
-                args=(_stop_event,),
-                daemon=True,
-                name="pixiv-crawler",
-            )
-            _crawl_thread.start()
-            logger.info("爬蟲已自動重啟")
-            await channel.send("Pixiv 爬蟲已自動重啟（每30分鐘）")
-    except asyncio.CancelledError:
-        pass
-
-
-def _run_user(user_id: int, stop_event: threading.Event,
-              status_callback=None):
-    try:
-        crawler.crawl_user_by_id(user_id, stop_event,
-                                 status_callback=status_callback)
-    except Exception as e:
-        logger.error(f"作者爬取失敗 (ID:{user_id}): {e}")
-
-
 # ──────────────────────────────────────────────
 # 指令註冊
 # ──────────────────────────────────────────────
@@ -205,94 +228,62 @@ def setup(tree: app_commands.CommandTree) -> None:
     @tree.command(name="pixiv爬蟲", description="Pixiv 爬蟲")
     @app_commands.describe(author_id="作者 user ID（數字）")
     async def pixiv_start(interaction: discord.Interaction, author_id: str = ""):
-        global _stop_event, _crawl_thread, _log_handler
-
-        if _is_running():
-            await interaction.response.send_message("爬取已在執行中，請先使用 /pixiv停止", ephemeral=True)
-            return
-
-        loop    = asyncio.get_event_loop()
-        channel = interaction.channel
-
-        _stop_event = threading.Event()
-        _log_handler = _attach_log_handler(channel, loop)
+        global _stop_event, _crawl_thread
+        loop = asyncio.get_event_loop()
 
         if author_id.strip():
             raw = author_id.strip()
             if not raw.isdigit():
                 await interaction.response.send_message("ID 必須是數字", ephemeral=True)
-                _detach_log_handler(_log_handler)
-                _log_handler = None
                 return
 
-            given_id = int(raw)
-            await interaction.response.send_message(
-                f"正在查詢作者 ID `{given_id}`，請稍候...", ephemeral=True
-            )
+            await interaction.response.defer(ephemeral=True)
 
-            # 直接視為作者 ID，查詢作者名稱
-            uid = given_id
+            uid = int(raw)
             try:
-                uname = await loop.run_in_executor(
-                    None, crawler.get_user_name, uid
-                )
+                uname = await loop.run_in_executor(None, crawler.get_user_name, uid)
                 logger.info(f"作者 {uid} 的名稱：{uname}")
             except Exception as e:
                 logger.warning(f"查詢作者 {uid} 名稱失敗: {e}")
                 uname = str(uid)
 
             author_label = uname if uname != str(uid) else str(uid)
-            notice = f"作者：**{author_label}**，開始爬取作品"
-
-            def _on_edit_done(future: "asyncio.Future[None]"):
-                try:
-                    future.result()
-                except Exception:
-                    pass
-
-            def _format_progress(total: int, downloaded: int, indexed: int, done: bool) -> str:
-                progress_title = "進度(已完成):" if done else "進度:"
-                return (
-                    f"作者：{author_label}，開始爬取作品\n"
-                    f"{progress_title}\n"
-                    f"總作品數：{total}\n"
-                    f"已下載：{downloaded}\n"
-                    f"已建立索引：{indexed}"
+            started_now = False
+            if not _is_running():
+                crawler.clear_priority_queue()
+                _clear_priority_notices()
+                _stop_event = threading.Event()
+                crawler.set_progress_hook(_dispatch_status_update, interval=5)
+                crawler.set_priority_user_done_hook(_dispatch_priority_done)
+                _crawl_thread = threading.Thread(
+                    target=_run_full,
+                    args=(_stop_event,),
+                    daemon=True,
+                    name="pixiv-crawler",
                 )
+                _crawl_thread.start()
+                started_now = True
 
-            def _status_callback(counters: dict, total_artworks: int, done: bool) -> None:
-                try:
-                    s = db.stats()
-                except Exception:
-                    s = {"total": 0, "downloaded": 0, "indexed": 0}
-                content = _format_progress(
-                    s["total"], s["downloaded"], s["indexed"], done
-                )
-                future = asyncio.run_coroutine_threadsafe(
-                    interaction.edit_original_response(content=content),
-                    loop,
-                )
-                future.add_done_callback(_on_edit_done)
-
-            _crawl_thread = threading.Thread(
-                target=_run_user,
-                args=(uid, _stop_event, _status_callback),
-                daemon=True,
-                name="pixiv-crawler",
-            )
-            _crawl_thread.start()
-
-            try:
-                s = await loop.run_in_executor(None, db.stats)
-            except Exception:
-                s = {"total": 0, "downloaded": 0, "indexed": 0}
-
-            await interaction.edit_original_response(
-                content=_format_progress(s["total"], s["downloaded"], s["indexed"])
-            )
+            queued = await loop.run_in_executor(None, crawler.enqueue_priority_user, uid)
+            if queued:
+                message = f"已將作者 {author_label}（{uid}）加入爬取佇列"
+            else:
+                message = f"作者 {author_label}（{uid}）已在優先佇列中"
+            if started_now:
+                message = "Pixiv全站爬取已啟動，" + message
+            _register_priority_notice(uid, interaction, loop, author_label)
+            await interaction.followup.send(message, ephemeral=True)
 
         else:
+            if _is_running():
+                await interaction.response.send_message("爬取已在執行中，請先使用 /pixiv停止", ephemeral=True)
+                return
+
+            crawler.clear_priority_queue()
+            _clear_priority_notices()
+            _stop_event = threading.Event()
             crawler.set_progress_hook(_dispatch_status_update, interval=5)
+            crawler.set_priority_user_done_hook(_dispatch_priority_done)
             _crawl_thread = threading.Thread(
                 target=_run_full,
                 args=(_stop_event,),
@@ -300,52 +291,34 @@ def setup(tree: app_commands.CommandTree) -> None:
                 name="pixiv-crawler",
             )
             _crawl_thread.start()
-            _restart_task = asyncio.create_task(
-                _auto_restart_loop(channel)
-            )
             await interaction.response.send_message(
-                "Pixiv全站爬取已啟動（每30分鐘自動重啟）", ephemeral=True
+                "Pixiv全站爬取已啟動，將持續運行直到手動停止", ephemeral=True
             )
 
     @tree.command(name="pixiv停止", description="停止 Pixiv 背景爬取")
     async def pixiv_stop(interaction: discord.Interaction):
-        global _log_handler, _restart_task
-
         if not _is_running():
             await interaction.response.send_message("目前沒有執行中的爬取", ephemeral=True)
             return
 
-        # 取消自動重啟
-        if _restart_task and not _restart_task.done():
-            _restart_task.cancel()
-            _restart_task = None
-
         _stop_event.set()
         crawler.set_progress_hook(None)
+        crawler.set_priority_user_done_hook(None)
+        crawler.clear_priority_queue()
+        _clear_priority_notices()
+        _last_status_counters.clear()
         await interaction.response.send_message(
             "已傳送停止訊號，爬取將在當前批次完成後結束", ephemeral=True
         )
 
-        loop = asyncio.get_event_loop()
-
         def _cleanup():
-            global _log_handler
             if _crawl_thread:
                 _crawl_thread.join(timeout=10)
-            if _log_handler:
-                _detach_log_handler(_log_handler)
-                _log_handler = None
-            # 最終狀態更新
-            _dispatch_status_update({})
-            _status_interactions.clear()
 
         threading.Thread(target=_cleanup, daemon=True).start()
 
-    @tree.command(name="pixiv狀態", description="查看 Pixiv 爬取狀態與統計（爬取中即時更新）")
+    @tree.command(name="pixiv狀態", description="查看 Pixiv 爬取狀態與統計")
     async def pixiv_status(interaction: discord.Interaction):
-        text = _build_status_text()
+        await _ensure_status_web_server()
+        text = _build_status_text() + f"\n\n🌐 即時狀態頁：{_status_public_url}"
         await interaction.response.send_message(text, ephemeral=True)
-
-        if _is_running():
-            loop = asyncio.get_event_loop()
-            _status_interactions.append((interaction, loop))

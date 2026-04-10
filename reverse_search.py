@@ -21,7 +21,7 @@ _PIXIV_LOCAL_TOP_K     = 1      # 最多回傳幾筆本地結果
 _SAUCENAO_URL  = 'https://saucenao.com/search.php'
 _SOUTUBOT_BASE = 'https://soutubot.moe'
 _SIM_THRESHOLD       = 80
-_SOUTU_SIM_THRESHOLD = 50
+_SOUTU_SIM_THRESHOLD = 60
 
 _HEADERS = {
     'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
@@ -271,41 +271,50 @@ async def _pixiv_local_search(image_data: bytes) -> list[dict]:
 
         _PHASH_BITS = 64
         results = []
-        high_sim_results = []
+        log_hits = []  # >80% 的命中，含連結，輸出至 log
         for hamming, idx in zip(distances[0], indices[0]):
             if idx < 0:
                 continue
             sim_pct = round((1.0 - hamming / _PHASH_BITS) * 100, 1)
-            if sim_pct >= 90.0:
-                illust_id = id_list[idx]
+            encoded = id_list[idx]
+            illust_id, page_index = fe.decode_id(encoded)
+
+            if sim_pct > 80.0:
                 row = db.get_artwork(illust_id)
                 if row:
-                    high_sim_results.append({
-                        'illust_id': illust_id,
-                        'title':     row['title'],
-                        'author':    row['user_name'],
+                    log_hits.append({
+                        'illust_id':  illust_id,
+                        'page_index': page_index,
+                        'title':      row['title'],
+                        'author':     row['user_name'],
                         'similarity': sim_pct,
+                        'url':        f'https://www.pixiv.net/artworks/{illust_id}',
                     })
+
             if sim_pct < _PIXIV_LOCAL_THRESHOLD:
                 continue
-            illust_id = id_list[idx]
-            row = db.get_artwork(illust_id)
-            if row is None:
+            # ≥95% 必然已在 log_hits（因為 95 > 80），直接取已查好的 row
+            hit = next((h for h in log_hits if h['illust_id'] == illust_id), None)
+            if hit is None:
                 continue
             results.append({
                 'engine':     'Pixiv本地',
                 'source':     'pixiv',
-                'title':      row['title'],
-                'author':     row['user_name'],
-                'page':       '',
-                'url':        f'https://www.pixiv.net/artworks/{illust_id}',
+                'title':      hit['title'],
+                'author':     hit['author'],
+                'page':       str(page_index + 1),
+                'url':        hit['url'],
                 'similarity': sim_pct,
             })
 
-        if high_sim_results:
-            print(f"[PIXIV_LOCAL] ≥90% 結果：")
-            for res in high_sim_results:
-                print(f"  ID:{res['illust_id']} | {res['title']} | {res['author']} | {res['similarity']}%")
+        if log_hits:
+            print(f"[PIXIV_LOCAL] >80% 命中 {len(log_hits)} 筆：")
+            for res in log_hits:
+                print(
+                    f"  [{res['similarity']}%] "
+                    f"ID:{res['illust_id']} p{res['page_index']} | "
+                    f"{res['title']} | {res['author']} | {res['url']}"
+                )
 
         print(f"[PIXIV_LOCAL] 命中 {len(results)} 筆 ≥{_PIXIV_LOCAL_THRESHOLD:.0f}%")
         return results
@@ -337,53 +346,12 @@ def _format_result(i: int, r: dict) -> str:
 
 async def reverse_image_search(image_data: bytes, mime_type: str) -> str:
     """
-    1. 本地 Pixiv FAISS ≥99.8% → 優先輸出本地結果（最多1筆）
-    2. 如果本地結果有新刊或R-18標籤，追加 soutubot 結果
-    3. SauceNAO 有 ≥80% 且有連結 → 輸出 SauceNAO 結果
-    4. 否則 fallback 到 soutubot ≥50% 結果
+    1. 本地 Pixiv FAISS ≥95% → 輸出本地結果
+       並行追加：SauceNAO ≥80% 有連結、soutubot ≥60% 有連結
+    2. 無本地結果 → SauceNAO ≥80% 有連結
+    3. 無 SauceNAO → soutubot ≥60% 有連結
     """
-    # ── 1. 本地 Pixiv 優先 ──
-    local_hits = await _pixiv_local_search(image_data)
-    if local_hits:
-        lines = ['本地資料庫搜尋結果：']
-        for i, r in enumerate(local_hits, 1):
-            lines.append(_format_result(i, r))
-
-        # 檢查標籤是否包含新刊、R-18 或 本/Cxxx 類標籤
-        append_soutu = False
-        if local_hits:
-            import pixiv_database as db
-            import json
-            illust_id = int(local_hits[0]['url'].split('/')[-1])
-            row = db.get_artwork(illust_id)
-            if row and row['tags']:
-                tags = json.loads(row['tags'])
-                if any(tag in ['新刊', 'R-18'] or tag.startswith('本') or (tag.startswith('C') and tag[1:].isdigit()) for tag in tags):
-                    append_soutu = True
-
-        if append_soutu:
-            # 執行 soutubot 搜尋並追加
-            soutu = await _soutubot_search(image_data, mime_type)
-            soutu_hits = sorted(
-                [r for r in soutu if r['url']
-                 and r['similarity'] >= _SOUTU_SIM_THRESHOLD
-                 and r.get('page')],
-                key=lambda r: r['similarity'],
-                reverse=True,
-            )
-            if soutu_hits:
-                for i, r in enumerate(soutu_hits[:3], len(local_hits) + 1):  # 從本地之後繼續編號
-                    lines.append(_format_result(i, r))
-
-        return '\n\n'.join(lines)
-
-    # ── 2 & 3. 外部搜尋（並行）──
-    soutu, sauce = await asyncio.gather(
-        _soutubot_search(image_data, mime_type),
-        _saucenao_search(image_data, mime_type),
-    )
-
-    def _hits(pool: list[dict]) -> list[dict]:
+    def _sauce_hits(pool: list[dict]) -> list[dict]:
         return sorted(
             [r for r in pool if r['url']
              and r['similarity'] >= _SIM_THRESHOLD
@@ -392,25 +360,60 @@ async def reverse_image_search(image_data: bytes, mime_type: str) -> str:
             reverse=True,
         )
 
-    sauce_hits = _hits(sauce)
-    if sauce_hits:
-        print(f'[RSEARCH] SauceNAO 命中 {len(sauce_hits)} 筆 ≥{_SIM_THRESHOLD}%')
-        lines = [f'找到 {len(sauce_hits)} 筆相似度 ≥{_SIM_THRESHOLD}% 的結果：']
-        for i, r in enumerate(sauce_hits, 1):
+    def _soutu_hits(pool: list[dict]) -> list[dict]:
+        return sorted(
+            [r for r in pool if r['url']
+             and r['similarity'] >= _SOUTU_SIM_THRESHOLD],
+            key=lambda r: r['similarity'],
+            reverse=True,
+        )
+
+    # ── 1. 本地 Pixiv + 外部並行 ──
+    local_hits, (soutu, sauce) = await asyncio.gather(
+        _pixiv_local_search(image_data),
+        asyncio.gather(
+            _soutubot_search(image_data, mime_type),
+            _saucenao_search(image_data, mime_type),
+        ),
+    )
+
+    if local_hits:
+        lines = ['本地資料庫搜尋結果：']
+        offset = len(local_hits)
+        for i, r in enumerate(local_hits, 1):
+            lines.append(_format_result(i, r))
+
+        # 追加 SauceNAO 有效結果
+        sh = _sauce_hits(sauce)
+        if sh:
+            print(f'[RSEARCH] 本地命中，追加 SauceNAO {len(sh)} 筆')
+            for i, r in enumerate(sh, offset + 1):
+                lines.append(_format_result(i, r))
+            offset += len(sh)
+
+        # 追加 soutubot 有效結果
+        th = _soutu_hits(soutu)
+        if th:
+            print(f'[RSEARCH] 本地命中，追加 soutubot {len(th)} 筆')
+            for i, r in enumerate(th[:3], offset + 1):
+                lines.append(_format_result(i, r))
+
+        return '\n\n'.join(lines)
+
+    # ── 2. 無本地結果 → 外部搜尋 ──
+    sh = _sauce_hits(sauce)
+    if sh:
+        print(f'[RSEARCH] SauceNAO 命中 {len(sh)} 筆 ≥{_SIM_THRESHOLD}%')
+        lines = [f'找到 {len(sh)} 筆相似度 ≥{_SIM_THRESHOLD}% 的結果：']
+        for i, r in enumerate(sh, 1):
             lines.append(_format_result(i, r))
         return '\n\n'.join(lines)
 
-    soutu_hits = sorted(
-        [r for r in soutu if r['url']
-         and r['similarity'] >= _SOUTU_SIM_THRESHOLD
-         and r.get('page')],
-        key=lambda r: r['similarity'],
-        reverse=True,
-    )
-    if soutu_hits:
-        print(f'[RSEARCH] SauceNAO 無符合，soutubot 命中（含page）{len(soutu_hits)} 筆 ≥{_SOUTU_SIM_THRESHOLD}%')
-        lines = [f'找到 {len(soutu_hits)} 筆相似度 ≥{_SOUTU_SIM_THRESHOLD}% 的結果：']
-        for i, r in enumerate(soutu_hits, 1):
+    th = _soutu_hits(soutu)
+    if th:
+        print(f'[RSEARCH] SauceNAO 無符合，soutubot 命中 {len(th)} 筆 ≥{_SOUTU_SIM_THRESHOLD}%')
+        lines = [f'找到 {len(th)} 筆相似度 ≥{_SOUTU_SIM_THRESHOLD}% 的結果：']
+        for i, r in enumerate(th, 1):
             lines.append(_format_result(i, r))
         return '\n\n'.join(lines)
 
