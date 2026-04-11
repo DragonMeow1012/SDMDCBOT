@@ -2,7 +2,7 @@
 Pixiv 模組設定 - 路徑指向 pixivdata/ 資料夾
 """
 import os
-from config import PIXIV_REFRESH_TOKEN  # noqa: F401 (re-export for crawler modules)
+from config import PIXIV_REFRESH_TOKEN, PIXIV_WEB_COOKIE  # noqa: F401 (re-export for crawler modules)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PIXIV_DATA_DIR = os.path.join(BASE_DIR, "pixivdata")
@@ -11,6 +11,7 @@ IMAGES_DIR = os.path.join(PIXIV_DATA_DIR, "images")
 DATA_DIR = os.path.join(PIXIV_DATA_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "pixiv.db")
 FAISS_INDEX_PATH = os.path.join(DATA_DIR, "feature.index")
+PAGE_LOG_DIR = os.path.join(PIXIV_DATA_DIR, "pagedata")
 
 LOGS_DIR = os.path.join(PIXIV_DATA_DIR, "logs")
 LOG_FILE = os.path.join(LOGS_DIR, "spider.log")
@@ -28,30 +29,39 @@ ALL_RANKING_MODES = [
     "week_original", "week_rookie",
 ]
 ALL_TAGS = [
-    # 一般插畫
-    "オリジナル", "女の子", "イラスト", "風景", "ファンタジー",
-    "男の子", "動物", "メカ", "建築", "食べ物",
-    "original", "illustration", "fantasy", "landscape", "cute",
-    "anime", "character", "digital art", "painting",
-    # 服裝・萌え要素
-    "メイド服", "ロリ", "ケモミミ",
-    # ブックマーク数
-    "10000users入り", "たんプリ1000users入り",
-    # ゲーム
-    "Fate/Grand Order", "原神", "ブルーアーカイブ", "ブルアカ",
-    "勝利の女神:NIKKE", "ウマ娘プリティーダービー", "アイドルマスター",
-    "プロジェクトセカイ", "アズールレーン",
-    "アークナイツ", "arknights", "Arknights:Endfield", "エンドフィールド", "ロッシ(エンドフィールド)", "ロッシ",
-    "崩壊:スターレイル", "東方Project",
-    "ポケットモンスター", "ゼルダの伝説", "スプラトゥーン",
-    # その他
-    "名探偵プリキュア!", "森亜るるか",
+    # 核心優先：蘿莉・可愛・特定作品 (最上位)
+    "森亜るるか", 
+    "ロリ", "メイド服", "ケモミミ", "#猫耳", "cute", "女の子", 
+    "たんプリ1000users入り", "10000users入り",
+
+    # 二次元熱門遊戲 
+    "アークナイツ", "arknights",                     # 明日方舟
+    "Arknights:Endfield", "エンドフィールド",        # 終末地
+    "ロッシ(エンドフィールド)", "ロッシ",
+    "ブルーアーカイブ", "ブルアカ", "bluearchive", "blueazur",
+    "プロジェクトセカイ", 
+    "原神", "崩壊:スターレイル", "ウマ娘プリティーダービー", 
+    "Fate/Grand Order", "アズールレーン",
+    "アイドルマスター", "ポケットモンスター",
+    "ゼルダの伝説", "スプラトゥーン",
+    "勝利の女神:NIKKE", "東方Project",
+
+    # 一般插畫與基礎分類
+    "オリジナル", "original", "イラスト", "illustration", "anime", 
+    "character", "digital art", "painting", "ファンタジー", "fantasy",
+
+    # 背景・物件與其他
+    "男の子"
 ]
-FULL_CRAWL_API_DELAY = 1.0
+
+FULL_CRAWL_API_DELAY = 1.3
 INDEX_REBUILD_INTERVAL = 500
 
 # tag 搜尋排序方向：熱門→最新→最舊，盡量覆蓋全站（含歷史作品）
-CRAWL_TAG_SORTS = ["popular_desc", "date_desc", "date_asc"]
+CRAWL_TAG_SORTS = ["date_desc", "date_asc"]
+
+# 額外追加關鍵字（去重）
+ALL_TAGS = list(dict.fromkeys([*ALL_TAGS, "セーラー服"]))
 
 # illust_new 種子：每輪從「全站最新上傳」抓的頁數（每頁 30 件）
 NEW_ILLUSTS_MAX_PAGES: int = 15
@@ -66,10 +76,18 @@ MAX_DOWNLOAD_RATE_LIMIT_Mbps = 120
 
 # illust_detail API 最大並發數（用於漫畫多頁 URL 補抓）
 API_DETAIL_CONCURRENCY: int = 3
+PIXIV_API_TIMEOUT: float = 60.0
+RELATED_API_TIMEOUT: float = 20.0
+
+# 擴散排程配額：避免 user_sync 長時間壟斷，讓 tag/ranking 可持續前進
+DIFFUSION_USER_QUOTA_PER_TICK: int = 5
+DIFFUSION_RELATED_QUOTA_PER_TICK: int = 5
+DIFFUSION_TAIL_MULTIPLIER: int = 5
+SEED_SOURCES_PER_DIFFUSION_TICK: int = 5
 
 # ===== 特徵提取設定 =====
 PHASH_BITS = 64          # pHash 位元數（8x8 DCT = 64 bits = 8 bytes）
-MAX_GALLERY_PAGES = 20   # 每件作品最多索引的頁數（避免大型漫畫拖垮爬取）
+MAX_GALLERY_PAGES = 100   # 每件作品最多索引的頁數（避免大型漫畫拖垮爬取）
 
 # ===== 狀態網頁伺服器 =====
 STATUS_WEB_PORT: int = int(os.environ.get("PIXIV_STATUS_PORT", "8766"))
@@ -86,5 +104,14 @@ USER_ID_SCAN_WORKERS: int = 3
 USER_ID_SCAN_DELAY: float = 1.5
 USER_ID_SCAN_CURSOR_FILE: str = os.path.join(DATA_DIR, "user_id_scan_cursor.json")
 
+# ===== Tag 進度爬取設定 =====
+TAG_CRAWL_PROGRESS_FILE: str = os.path.join(DATA_DIR, "tag_crawl_progress.json")
+TAG_PAGES_PER_VISIT: int = 100   # 每個 tag/sort 每次最多抓幾頁後換 tag
+USER_SCAN_BATCH_SIZE: int = 50   # tag 抓完 100 頁後，切換爬 user_scan 的有效用戶數
+
+# 作者作品抓取類型（會逐類型抓取後去重）
+USER_FETCH_TYPES = ["illust", "manga", "ugoira"]
+
 # ===== 代理設定（可選）=====
 PROXY = os.environ.get("HTTP_PROXY", None)
+PIXIV_TAG_IMPERSONATE = "chrome124"

@@ -27,7 +27,8 @@ if not GEMINI_API_KEYS:
     raise ValueError("❌ 缺少至少一組 GEMINI_API_KEY，請在 .env 中設定")
 
 # --- Pixiv（選填，設定後可使用爬取功能）---
-PIXIV_REFRESH_TOKEN: str = os.getenv("PIXIV_REFRESH_TOKEN", "l-dDIwKpJerOUnQGWYXvRLCyIWsYLHlbr2axiWbYleU")
+PIXIV_REFRESH_TOKEN: str = os.getenv("PIXIV_REFRESH_TOKEN", "")
+PIXIV_WEB_COOKIE: str = os.getenv("PIXIV_WEB_COOKIE", "")
 NGROK_AUTH_TOKEN: str = os.getenv("NGROK_AUTH_TOKEN", "")
 
 # --- LINE Bot（選填，不設定則不啟動 LINE 功能）---

@@ -42,6 +42,8 @@ logger.setLevel(logging.INFO)
 
 _stop_event: threading.Event | None = None
 _crawl_thread: threading.Thread | None = None
+_heartbeat_stop_event: threading.Event | None = None
+_heartbeat_thread: threading.Thread | None = None
 
 _last_status_counters: dict = {}
 _priority_notice_requests: "dict[int, list[tuple[discord.Interaction, asyncio.AbstractEventLoop, str]]]" = {}
@@ -51,15 +53,18 @@ _status_public_url: str = ""
 STATUS_JSON = Path("pixivdata/data/status.json")
 _STREAMLIT_PORT = STATUS_WEB_PORT
 
+HEARTBEAT_INTERVAL_SEC = 15
+HEARTBEAT_LOG_EVERY_SEC = 60
 
-def _write_status_json() -> None:
+
+def _write_status_json(running_override: bool | None = None) -> None:
     try:
         s = db.stats()
     except Exception:
         s = {"total": 0, "downloaded": 0, "indexed": 0}
 
     data: dict = {
-        "running": _is_running(),
+        "running": _is_running() if running_override is None else running_override,
         "total": s["total"],
         "downloaded": s["downloaded"],
         "indexed": s["indexed"],
@@ -146,6 +151,42 @@ def _dispatch_status_update(counters: dict) -> None:
         _write_status_json()
 
 
+def _heartbeat_loop(stop_event: threading.Event) -> None:
+    last_log_at = 0.0
+    while not stop_event.is_set():
+        running = _is_running()
+        _write_status_json(running_override=running)
+        now = time.monotonic()
+        if running and now - last_log_at >= HEARTBEAT_LOG_EVERY_SEC:
+            logger.info('[heartbeat] Pixiv crawler thread alive')
+            last_log_at = now
+        for _ in range(HEARTBEAT_INTERVAL_SEC):
+            if stop_event.is_set():
+                break
+            time.sleep(1)
+
+
+def _start_heartbeat() -> None:
+    global _heartbeat_stop_event, _heartbeat_thread
+    if _heartbeat_thread is not None and _heartbeat_thread.is_alive():
+        return
+    _heartbeat_stop_event = threading.Event()
+    _heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop,
+        args=(_heartbeat_stop_event,),
+        daemon=True,
+        name='pixiv-heartbeat',
+    )
+    _heartbeat_thread.start()
+
+
+def _stop_heartbeat() -> None:
+    global _heartbeat_stop_event, _heartbeat_thread
+    if _heartbeat_stop_event is not None:
+        _heartbeat_stop_event.set()
+    _heartbeat_thread = None
+
+
 
 def _register_priority_notice(
     user_id: int,
@@ -183,24 +224,28 @@ async def _send_priority_done_notice(
     try:
         await interaction.followup.send(text, ephemeral=True)
         return
-    except Exception:
-        pass
-
-    try:
-        await interaction.user.send(text)
     except Exception as e:
-        logger.warning(f"優先作者完成通知失敗 {event.get('user_id')}: {e}")
+        logger.warning(f"優先作者 ephemeral 通知失敗 {event.get('user_id')}: {e}")
 
 
 def _dispatch_priority_done(event: dict) -> None:
     user_id = int(event["user_id"])
     requests = _priority_notice_requests.pop(user_id, [])
+    if not requests:
+        logger.warning(f"優先作者完成但無待通知請求 user_id={user_id}")
+        return
     for interaction, loop, author_label in requests:
         try:
-            asyncio.run_coroutine_threadsafe(
+            fut = asyncio.run_coroutine_threadsafe(
                 _send_priority_done_notice(interaction, author_label, event),
                 loop,
             )
+            def _log_future_result(f):
+                try:
+                    f.result()
+                except Exception as ex:
+                    logger.warning(f"優先作者通知執行失敗 {user_id}: {ex}")
+            fut.add_done_callback(_log_future_result)
         except Exception as e:
             logger.warning(f"派送優先作者完成通知失敗 {user_id}: {e}")
 
@@ -216,22 +261,29 @@ def _is_running() -> bool:
 
 def _run_full(stop_event: threading.Event):
     """爬蟲執行緒主體，含自動重啟邏輯。"""
-    while not stop_event.is_set():
-        try:
-            crawler.run_full_crawl(stop_event)
-        except Exception as e:
-            logger.error(f"全站爬取異常: {e}")
-        if stop_event.is_set():
-            break
-        # 非正常結束（例外或 token 失效）→ 等待後自動重啟
-        logger.info("自動重啟：傳送停止訊號")
-        for _ in range(30):  # 等 30 秒再重啟
+    global _crawl_thread
+    try:
+        while not stop_event.is_set():
+            _write_status_json(running_override=True)
+            logger.info('???? Pixiv ????')
+            try:
+                crawler.run_full_crawl(stop_event)
+            except Exception as e:
+                logger.error(f"全站爬取異常: {e}")
             if stop_event.is_set():
                 break
-            time.sleep(1)
-        if stop_event.is_set():
-            break
-        logger.info("爬蟲已自動重啟")
+            logger.info("自動重啟：等待 90 分鐘後重試")
+            for _ in range(90 * 60):
+                if stop_event.is_set():
+                    break
+                time.sleep(1)
+            if stop_event.is_set():
+                break
+            logger.info("爬蟲已自動重啟")
+    finally:
+        _crawl_thread = None
+        _write_status_json(running_override=False)
+        _stop_heartbeat()
 
 # ──────────────────────────────────────────────
 # 指令註冊
@@ -244,6 +296,7 @@ def setup(tree: app_commands.CommandTree) -> None:
     async def pixiv_start(interaction: discord.Interaction, author_id: str = ""):
         global _stop_event, _crawl_thread
         loop = asyncio.get_event_loop()
+        crawler.set_priority_user_done_hook(_dispatch_priority_done)
 
         if author_id.strip():
             raw = author_id.strip()
@@ -262,9 +315,12 @@ def setup(tree: app_commands.CommandTree) -> None:
                 uname = str(uid)
 
             author_label = uname if uname != str(uid) else str(uid)
+            queued = await loop.run_in_executor(None, crawler.enqueue_priority_user, uid)
             started_now = False
             if not _is_running():
-                crawler.clear_priority_queue()
+                if not queued:
+                    crawler.clear_priority_queue()
+                    queued = await loop.run_in_executor(None, crawler.enqueue_priority_user, uid)
                 _clear_priority_notices()
                 _stop_event = threading.Event()
                 crawler.set_progress_hook(_dispatch_status_update, interval=5)
@@ -276,9 +332,12 @@ def setup(tree: app_commands.CommandTree) -> None:
                     name="pixiv-crawler",
                 )
                 _crawl_thread.start()
+                _start_heartbeat()
+                try:
+                    await _ensure_status_web_server()
+                except Exception as e:
+                    logger.warning(f"啟動 Pixiv 狀態網站失敗: {e}")
                 started_now = True
-
-            queued = await loop.run_in_executor(None, crawler.enqueue_priority_user, uid)
             if queued:
                 message = f"已將作者 {author_label}（{uid}）加入爬取佇列"
             else:
@@ -292,6 +351,7 @@ def setup(tree: app_commands.CommandTree) -> None:
             if _is_running():
                 await interaction.response.send_message("爬取已在執行中，請先使用 /pixiv停止", ephemeral=True)
                 return
+            await interaction.response.defer(ephemeral=True)
 
             crawler.clear_priority_queue()
             _clear_priority_notices()
@@ -305,14 +365,20 @@ def setup(tree: app_commands.CommandTree) -> None:
                 name="pixiv-crawler",
             )
             _crawl_thread.start()
-            await interaction.response.send_message(
+            _start_heartbeat()
+            try:
+                await _ensure_status_web_server()
+            except Exception as e:
+                logger.warning(f"啟動 Pixiv 狀態網站失敗: {e}")
+            await interaction.followup.send(
                 "Pixiv全站爬取已啟動，將持續運行直到手動停止", ephemeral=True
             )
 
     @tree.command(name="pixiv停止", description="停止 Pixiv 背景爬取")
     async def pixiv_stop(interaction: discord.Interaction):
+        global _crawl_thread
         if not _is_running():
-            await interaction.response.send_message("目前沒有執行中的爬取", ephemeral=True)
+            await interaction.response.send_message("目前沒有正在執行的 Pixiv 爬蟲", ephemeral=True)
             return
 
         _stop_event.set()
@@ -321,18 +387,25 @@ def setup(tree: app_commands.CommandTree) -> None:
         crawler.clear_priority_queue()
         _clear_priority_notices()
         _last_status_counters.clear()
+        _write_status_json(running_override=False)
+        _stop_heartbeat()
         await interaction.response.send_message(
-            "已傳送停止訊號，爬取將在當前批次完成後結束", ephemeral=True
+            "已送出停止請求，Pixiv 爬蟲會在目前工作收尾後停止", ephemeral=True
         )
 
         def _cleanup():
+            global _crawl_thread
             if _crawl_thread:
                 _crawl_thread.join(timeout=10)
+            if _crawl_thread and not _crawl_thread.is_alive():
+                _crawl_thread = None
+            _write_status_json(running_override=False)
 
         threading.Thread(target=_cleanup, daemon=True).start()
 
     @tree.command(name="pixiv狀態", description="查看 Pixiv 爬取狀態與統計")
     async def pixiv_status(interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         await _ensure_status_web_server()
         text = _build_status_text() + f"\n\n🌐 即時狀態頁：{_status_public_url}"
-        await interaction.response.send_message(text, ephemeral=True)
+        await interaction.followup.send(text, ephemeral=True)
