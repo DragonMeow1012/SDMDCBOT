@@ -31,7 +31,7 @@ ALL_RANKING_MODES = [
 ALL_TAGS = [
     # 核心優先：蘿莉・可愛・特定作品 (最上位)
     "森亜るるか", 
-    "ロリ", "メイド服", "ケモミミ", "#猫耳", "cute", "女の子", 
+    "ロリ", "メイド服", "ケモミミ", "猫耳", "cute", "女の子", 
     "たんプリ1000users入り", "10000users入り",
 
     # 二次元熱門遊戲 
@@ -108,6 +108,7 @@ USER_ID_SCAN_CURSOR_FILE: str = os.path.join(DATA_DIR, "user_id_scan_cursor.json
 TAG_CRAWL_PROGRESS_FILE: str = os.path.join(DATA_DIR, "tag_crawl_progress.json")
 TAG_PAGES_PER_VISIT: int = 100   # 每個 tag/sort 每次最多抓幾頁後換 tag
 USER_SCAN_BATCH_SIZE: int = 50   # tag 抓完 100 頁後，切換爬 user_scan 的有效用戶數
+TAGS_PER_ROUND: int = len(ALL_TAGS) * 2  # 每輪輪詢的 tag 數量（預設跑全部）
 
 # 作者作品抓取類型（會逐類型抓取後去重）
 USER_FETCH_TYPES = ["illust", "manga", "ugoira"]

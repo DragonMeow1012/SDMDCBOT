@@ -135,7 +135,7 @@ _priority_user_ids: set[int] = set()
 _priority_lock = threading.Lock()
 _priority_user_done_hook: "Callable[[dict], None] | None" = None
 _page_log_lock = threading.Lock()
-_PAGE_LOG_MAX_LINES = 5000
+_PAGE_LOG_MAX_LINES = 20000
 _tag_request_lock = threading.Lock()
 _tag_progress_lock = threading.Lock()
 _tag_progress: dict[str, dict] = {}   # key: "tag::sort", value: {page, done, chosen_query, chosen_sort, ts}
@@ -186,6 +186,7 @@ def _log_page_fetch(
     source: str,
     page: int,
     *,
+    log_file: str = "page_log.jsonl",
     offset: int | None = None,
     items: int | None = None,
     next_url: bool | None = None,
@@ -205,7 +206,7 @@ def _log_page_fetch(
         payload["has_next_url"] = next_url
     if extra:
         payload.update(extra)
-    _append_page_log("page_log.jsonl", payload)
+    _append_page_log(log_file, payload)
 
 
 def _log_timeout(event: str, target: str, timeout: float, *, page: int | None = None, extra: dict | None = None) -> None:
@@ -284,6 +285,15 @@ def _update_tag_progress(
             "chosen_sort": chosen_sort,
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+
+
+def _get_last_processed_tag() -> "str | None":
+    """返回 _tag_progress 中 ts 最新的 tag key，用於重啟後對齊斷點。"""
+    with _tag_progress_lock:
+        entries = {k: v for k, v in _tag_progress.items() if k != "__global__" and "ts" in v}
+    if not entries:
+        return None
+    return max(entries, key=lambda k: entries[k]["ts"])
 
 
 async def _to_thread_with_timeout(func, *args, timeout: float | None = None, **kwargs):
@@ -670,6 +680,7 @@ def _fetch_tag(
     max_pages: "int | None" = None,
     resume_query: "str | None" = None,
     resume_sort: "str | None" = None,
+    stop_event: "threading.Event | None" = None,
 ) -> "tuple[list[dict], bool, int, str | None, str | None]":
     """
     抓取 tag 搜尋結果，支援斷點續抓與頁數限制。
@@ -677,6 +688,7 @@ def _fetch_tag(
     start_page:   起始頁碼（1-based），恢復上次中斷的進度
     max_pages:    本次最多抓幾頁（None=不限）
     resume_query/sort: 上次成功使用的 query/sort，跳過重新探測
+    stop_event:   若設定則在每頁之間檢查，設置時提前結束並儲存斷點
 
     回傳 (artworks, is_done, last_success_page, effective_query, effective_sort)
         is_done:           True=已無更多頁面，False=因 max_pages 或錯誤中止
@@ -775,6 +787,10 @@ def _fetch_tag(
             # ── 翻頁迴圈 ─────────────────────────────────────────────────
             is_done = True
             while has_next:
+                # stop_event 在每頁之間檢查，讓停止指令能在頁間生效
+                if stop_event is not None and stop_event.is_set():
+                    is_done = False
+                    break
                 if max_pages is not None and pages_fetched >= max_pages:
                     is_done = False
                     break
@@ -1237,83 +1253,66 @@ async def _process_batch_async(
         status_callback(counters, total_artworks or len(artworks), False)
 
 
-# ──────────────────────────────────────────────
-# User ID 掃描批次（tag→user 交替用）
-# ──────────────────────────────────────────────
-
+#──────────────────────────────────────────────
+#User ID 掃描批次
+#──────────────────────────────────────────────
 async def _scan_user_batch_async(
-    scan_api: "AppPixivAPI",
-    dl_headers: dict,
-    visited_users: "set[int]",
-    stop_event: "threading.Event",
-    batch_size: int,
-    on_success: "Callable[[dict], None]",
-    main_api: "AppPixivAPI | None" = None,
+    scan_api: "AppPixivAPI", dl_headers: dict, visited_users: "set[int]", stop_event: "threading.Event",
+    batch_size: int, on_success: "Callable[[dict], None]", main_api: "AppPixivAPI | None" = None,
 ) -> int:
-    """
-    從上次記錄的 cursor 開始，掃描直到找到 batch_size 個有效用戶並爬取其作品。
-    回傳實際處理的有效用戶數。相關作品/擴散不在本函式處理。
-    """
-    if not getattr(config, "USER_ID_SCAN_ENABLED", True):
-        return 0
+    if not getattr(config, "USER_ID_SCAN_ENABLED", True): return 0
 
     delay = float(getattr(config, "USER_ID_SCAN_DELAY", 1.5))
     cursor = _load_scan_cursor()
+
+#[關鍵修改] 增加探測次數計數器
+    scanned_count = 0
     users_done = 0
+
     download_sem = asyncio.Semaphore(config.DOWNLOAD_WORKERS)
     api_detail_sem = asyncio.Semaphore(getattr(config, "API_DETAIL_CONCURRENCY", 3))
     api_lock = threading.Lock()
     counters = {"downloaded": 0, "skipped": 0, "failed": 0}
     _proc_api = main_api or scan_api
 
-    connector = aiohttp.TCPConnector(
-        limit=config.DOWNLOAD_WORKERS * 3,
-        enable_cleanup_closed=True,
-        ttl_dns_cache=300,
-    )
+    connector = aiohttp.TCPConnector(limit=config.DOWNLOAD_WORKERS * 3, enable_cleanup_closed=True, ttl_dns_cache=300)
     async with aiohttp.ClientSession(headers=dl_headers, connector=connector) as session:
-        while users_done < batch_size and not stop_event.is_set():
+
+#[關鍵修改] 只要「探測次數」達到 batch_size 就無條件退出，不卡死迴圈
+        while scanned_count < batch_size and not stop_event.is_set():
             cursor += 1
+            scanned_count += 1  # 每次 ID 前進都算一次探測
             _save_scan_cursor(cursor)
 
-            if cursor in visited_users:
-                continue
+            if cursor in visited_users: continue
             visited_users.add(cursor)
 
-            # 探測 user_detail
             try:
                 result = await _to_thread_with_timeout(scan_api.user_detail, cursor)
                 await asyncio.sleep(delay)
-                if not result or "user" not in result:
-                    continue
+                if not result or "user" not in result: continue
                 user_name = result["user"]["name"]
             except Exception as e:
                 logger.debug(f"[user_scan] user={cursor} 無效: {e}")
                 await asyncio.sleep(delay)
                 continue
 
-            # 抓取該作者全部作品
             try:
-                artworks = await _to_thread_with_timeout(
-                    _fetch_user_artworks_sync, scan_api, cursor, api_lock
-                )
+                artworks = await _to_thread_with_timeout(_fetch_user_artworks_sync, scan_api, cursor, api_lock)
             except Exception as e:
                 logger.warning(f"[user_scan] user={cursor} 作品抓取失敗: {e}")
                 artworks = []
 
             if artworks:
                 logger.info(f"[user_scan] user={cursor} ({user_name}) → {len(artworks)} 件")
-                await _process_batch_async(
-                    _proc_api, session, artworks, counters,
-                    stop_event, download_sem,
-                    on_success=on_success,
-                    api_sem=api_detail_sem,
-                )
+                await _process_batch_async(_proc_api, session, artworks, counters, stop_event, download_sem, on_success=on_success, api_sem=api_detail_sem)
 
             users_done += 1
 
     _save_scan_cursor(cursor)
-    logger.info(f"[user_scan] 批次完成，處理 {users_done} 位用戶，cursor={cursor}")
+
+#讓 Log 更清楚顯示狀況
+    logger.info(f"[user_scan] 批次結束 | 探測了 {scanned_count} 個 ID，實際有效用戶 {users_done} 位，目前 cursor={cursor}")
     return users_done
 
 
@@ -1520,57 +1519,80 @@ async def _run_full_crawl_async(
         try:
             await _drain_priority()
 
-            # ── 建立本輪 tag 優先排序清單 ────────────────────────────────
-            # 未開始 (page=0) > 進行中 (done=False) > 已完成 (done=True，重跑找新圖)
+# ── 建立本輪 tag 輪詢清單 (Carousel) ────────────────────────────────
+            # 確保 sort 在外層，tag 在內層，達成先廣度掃描所有 tag 的「最新」
             tags_sorts = [
                 (tag, sort)
+                for sort in getattr(config, "CRAWL_TAG_SORTS", ["date_desc", "date_asc"])
                 for tag in config.ALL_TAGS
-                for sort in getattr(config, "CRAWL_TAG_SORTS", ["popular_desc", "date_desc", "date_asc"])
             ]
 
-            def _tag_priority(ts: tuple) -> int:
-                p = _get_tag_progress(ts[0], ts[1])
-                if not p:
-                    return 0   # 從未抓過 → 最優先
-                if not p.get("done", False):
-                    return 1   # 進行中（上次未抓完）→ 次優先
-                return 2       # 已完成
+            # [關鍵修復] 根據全域紀錄旋轉清單，確保重啟後不會從頭開始
+            last_tag_key = _get_last_processed_tag()
+            if last_tag_key:
+                resume_idx = -1
+                for i, (t, s) in enumerate(tags_sorts):
+                    if _tag_key(t, s) == last_tag_key:
+                        resume_idx = i
+                        break
+                
+                # 如果找到了上次的斷點，將清單切開並重新拼接
+                # 讓「上次跑的那個」排到最後面，它的「下一個」變成清單第 0 個
+                if resume_idx != -1:
+                    logger.info(f"[輪詢] 偵測到上次斷點 {last_tag_key}，正在對齊清單順序...")
+                    tags_sorts = tags_sorts[resume_idx + 1:] + tags_sorts[:resume_idx + 1]
 
-            # 只處理尚未完成的 tag（priority < 2）。
-            # done=True 的 tag 不清除進度，保留在檔案中以便重啟後識別狀態。
-            # 若所有 tag 皆已完成（active_tags 為空），才將全部 tag 納入
-            # 重跑（每個都從第 1 頁開始），以便找出新上傳的圖片。
-            active_tags = [ts for ts in tags_sorts if _tag_priority(ts) < 2]
+            # ── 過濾與分組 ───────────────────────────────────────────────────
+            # 1. 先過濾掉 done: True 的項目 (如你所說，44頁跑完的就跳過)
+            active_tags = [ts for ts in tags_sorts if not _get_tag_progress(ts[0], ts[1]).get("done", False)]
+
+            # 2. 若過濾後空了，代表全站掃完一輪，觸發重置
             if not active_tags:
-                logger.info("[進度] 所有 tag 均已完成，本輪重跑全部 tag 找新圖")
-                active_tags = list(tags_sorts)
-            active_tags.sort(key=_tag_priority)
+                logger.info("[進度] 所有排序下的 Tag 均已跑完，本輪將重置進度開啟新巡迴...")
+                with _tag_progress_lock:
+                    for k in list(_tag_progress.keys()):
+                        if k != "__global__":
+                            _tag_progress[k]["done"] = False
+                            _tag_progress[k]["page"] = 0
+                _save_tag_progress()
+                # 重置後，重新套用一次旋轉後的原始清單
+                active_tags = [ts for ts in tags_sorts]
+
+            # 3. 根據 TAGS_PER_ROUND 提取本輪要跑的項目 (例如前 2 個)
+            tags_to_process = active_tags[:config.TAGS_PER_ROUND]
 
             # ── tag → user_scan 交替主迴圈 ───────────────────────────────
             # 每個 tag 抓 max_tag_pages 頁後，觸發一次 user_scan 批次
-            for tag, sort in active_tags:
+            for tag, sort in tags_to_process:
                 if stop_event.is_set():
                     break
                 await _drain_priority()
 
-                # 讀取此 tag/sort 的斷點進度
+                # 讀取此 tag/sort 的斷點進度（tags_to_process 已過濾 done=True，直接取斷點）
                 progress = _get_tag_progress(tag, sort)
-                if progress.get("done", False):
-                    # 已完成的 tag：本輪重跑找新圖，從第 1 頁開始，不沿用舊查詢
-                    start_page = 1
-                    resume_q = None
-                    resume_s = None
-                else:
-                    last_p = progress.get("page", 0)
-                    start_page = last_p + 1 if last_p > 0 else 1
-                    resume_q = progress.get("chosen_query")
-                    resume_s = progress.get("chosen_sort")
+                last_p = progress.get("page", 0)
+                start_page = last_p + 1 if last_p > 0 else 1
+                resume_q = progress.get("chosen_query")
+                resume_s = progress.get("chosen_sort")
 
                 try:
-                    artworks, is_done, last_page, eff_q, eff_s = await _to_thread_with_timeout(
-                        _fetch_tag, api, tag, sort,
-                        start_page, max_tag_pages, resume_q, resume_s,
-                    )
+                    # _fetch_tag 是多頁長跑任務，每頁 HTTP request 已有自己的 timeout；
+                    # 不套外層 asyncio timeout，改靠 stop_event 在頁間中斷。
+                    # 同時啟動背景定時任務，每 5 秒觸發 progress hook 讓狀態保持更新。
+                    async def _tag_status_pulse():
+                        while True:
+                            await asyncio.sleep(5)
+                            if _progress_hook:
+                                _progress_hook(dict(counters))
+                    _pulse_task = asyncio.create_task(_tag_status_pulse())
+                    try:
+                        artworks, is_done, last_page, eff_q, eff_s = await asyncio.to_thread(
+                            _fetch_tag, api, tag, sort,
+                            start_page, max_tag_pages, resume_q, resume_s, stop_event,
+                        )
+                    finally:
+                        _pulse_task.cancel()
+                        await asyncio.gather(_pulse_task, return_exceptions=True)
                     _update_tag_progress(tag, sort, last_page, is_done, eff_q, eff_s)
                     _save_tag_progress()
                     logger.info(
