@@ -57,6 +57,9 @@ ALL_TAGS = [
 FULL_CRAWL_API_DELAY = 1.3
 INDEX_REBUILD_INTERVAL = 500
 
+# DB 批次查詢「已完整索引」作品的 chunk size（避免載入全部 ID 進記憶體；也避免 SQLite 變數上限）
+FULLY_INDEXED_QUERY_CHUNK_SIZE: int = 800
+
 # tag 搜尋排序方向：熱門→最新→最舊，盡量覆蓋全站（含歷史作品）
 CRAWL_TAG_SORTS = ["date_desc", "date_asc"]
 
@@ -78,6 +81,7 @@ MAX_DOWNLOAD_RATE_LIMIT_Mbps = 120
 API_DETAIL_CONCURRENCY: int = 3
 PIXIV_API_TIMEOUT: float = 60.0
 RELATED_API_TIMEOUT: float = 20.0
+RELATED_MAX_PAGES: int = 10          # 相關作品每次最多抓幾頁後跳出（避免滾雪球）
 
 # 擴散排程配額：避免 user_sync 長時間壟斷，讓 tag/ranking 可持續前進
 DIFFUSION_USER_QUOTA_PER_TICK: int = 5
@@ -106,8 +110,9 @@ USER_ID_SCAN_CURSOR_FILE: str = os.path.join(DATA_DIR, "user_id_scan_cursor.json
 
 # ===== Tag 進度爬取設定 =====
 TAG_CRAWL_PROGRESS_FILE: str = os.path.join(DATA_DIR, "tag_crawl_progress.json")
-TAG_PAGES_PER_VISIT: int = 100   # 每個 tag/sort 每次最多抓幾頁後換 tag
-USER_SCAN_BATCH_SIZE: int = 50   # tag 抓完 100 頁後，切換爬 user_scan 的有效用戶數
+RANKING_LAST_RUN_FILE: str = os.path.join(DATA_DIR, "ranking_last_run.json")
+TAG_PAGES_PER_VISIT: int = 200   # 每個 tag/sort 每次最多抓幾頁後換 tag
+USER_SCAN_BATCH_SIZE: int = 100   # tag 抓完 200 頁後，切換爬 user_scan 的有效用戶數
 TAGS_PER_ROUND: int = len(ALL_TAGS) * 2  # 每輪輪詢的 tag 數量（預設跑全部）
 
 # 作者作品抓取類型（會逐類型抓取後去重）

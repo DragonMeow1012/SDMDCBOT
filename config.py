@@ -37,7 +37,7 @@ LINE_CHANNEL_SECRET: str = os.getenv('LINE_CHANNEL_SECRET', '')
 LINE_WEBHOOK_PORT: int = int(os.getenv('LINE_WEBHOOK_PORT', '8080'))
 
 # --- Gemini 模型 ---
-GEMINI_MODEL_NAME = "gemini-3.1-flash-lite-preview"
+GEMINI_MODEL_NAME = "models/gemma-4-31b-it"
 API_DELAY = 5.0          # 每次 API 請求之間的最短間隔（秒）
 HISTORY_MAX_TURNS = 150  # 每頻道儲存的最大歷史訊息筆數（超出時刪除最舊的）
 

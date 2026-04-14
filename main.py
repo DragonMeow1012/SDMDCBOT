@@ -84,6 +84,11 @@ def _is_text_file(filename: str) -> bool:
     return os.path.splitext(filename)[1].lower() in _TEXT_EXTENSIONS
 
 
+def _strip_bot_mention(text: str, bot_id: int) -> str:
+    # Discord mention 可能是 <@id> 或 <@!id>
+    return re.sub(rf'<@!?\s*{bot_id}\s*>', '', text).strip()
+
+
 # ---------------------------------------------------------------------------
 # Session 初始化
 # ---------------------------------------------------------------------------
@@ -125,7 +130,22 @@ async def on_ready() -> None:
 
 @client.event
 async def on_message(msg: discord.Message) -> None:
-    if msg.author == client.user or not client.user.mentioned_in(msg):
+    if msg.author == client.user:
+        return
+
+    mentioned: bool = client.user.mentioned_in(msg)
+
+    # 移除 @提及，取得純文字
+    raw_text: str = _strip_bot_mention(msg.content, client.user.id)
+
+    # !kb 指令攔截（不送 Gemini；不需要 @ 也能用）
+    if re.match(r'^!kb(\s|$)', raw_text):
+        args = raw_text[3:].strip()
+        await handle_kb_command(msg, args)
+        return
+
+    # 只有被 @ 時才走 AI 對話流程
+    if not mentioned:
         return
 
     cid: int        = msg.channel.id
@@ -137,16 +157,8 @@ async def on_message(msg: discord.Message) -> None:
         print(f'[INIT] ch={cid} personality={personality}')
         _init_session(cid, personality, sess)
 
-    # 移除 @提及，取得純文字
-    raw_text: str = msg.content.replace(f'<@{client.user.id}>', '').strip()
-
     if not raw_text and not msg.attachments:
         await msg.reply('主...主人...請問...需...需要什麼協助嗎？喵嗚...')
-        return
-
-    # !kb 指令攔截（不送 Gemini）
-    if raw_text.startswith('!kb ') or raw_text.startswith('!kb　'):
-        await handle_kb_command(msg, raw_text[4:])
         return
 
     print(f'[MSG] ch={cid} [{personality}]: {raw_text[:80]}')

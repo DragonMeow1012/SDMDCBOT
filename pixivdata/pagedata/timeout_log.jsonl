@@ -33,3 +33,30 @@
 {"event": "api_call", "target": "_fetch_tag", "timeout": 60.0, "args": ["<pixivpy3.aapi.AppPixivAPI object at 0x00000202A8552FD0>", "森亜るるか", "date_desc", "1"], "kwargs": {}, "ts": "2026-04-11 09:51:32"}
 {"event": "api_call", "target": "_fetch_tag", "timeout": 60.0, "args": ["<pixivpy3.aapi.AppPixivAPI object at 0x0000019E28DAB8C0>", "森亜るるか", "date_desc", "1"], "kwargs": {}, "ts": "2026-04-11 10:06:47"}
 {"event": "api_call", "target": "_fetch_tag", "timeout": 60.0, "args": ["<pixivpy3.aapi.AppPixivAPI object at 0x0000019E2C51FC50>", "森亜るるか", "date_desc", "1"], "kwargs": {}, "ts": "2026-04-11 10:08:52"}
+{"event": "api_call", "target": "illust_related", "timeout": 20.0, "args": [], "kwargs": {"illust_id": "136273421"}, "ts": "2026-04-11 22:37:52"}
+{"event": "api_call", "target": "_fetch_user_artworks_sync", "timeout": 60.0, "args": ["<pixivpy3.aapi.AppPixivAPI object at 0x000001E2F6FCBCB0>", "61816135"], "kwargs": {}, "ts": "2026-04-12 00:41:10"}
+{"event": "api_call", "target": "_fetch_ranking", "timeout": 60.0, "args": ["<pixivpy3.aapi.AppPixivAPI object at 0x000001E2F6FCBCB0>", "day"], "kwargs": {}, "ts": "2026-04-12 01:22:32"}
+{"event": "api_call", "target": "_fetch_user_artworks_sync", "timeout": 60.0, "args": ["<pixivpy3.aapi.AppPixivAPI object at 0x000001E2F6FCBCB0>", "42827517"], "kwargs": {}, "ts": "2026-04-12 03:46:14"}
+{"event": "api_call", "target": "illust_detail", "timeout": 60.0, "args": ["127546008"], "kwargs": {}, "ts": "2026-04-12 13:41:13"}
+{"event": "api_call", "target": "illust_detail", "timeout": 60.0, "args": ["57012810"], "kwargs": {}, "ts": "2026-04-13 00:14:53"}
+{"event": "api_call", "target": "_fetch_user_artworks_sync", "timeout": 60.0, "args": ["<pixivpy3.aapi.AppPixivAPI object at 0x000001E2F6FCBCB0>", "111980180"], "kwargs": {}, "ts": "2026-04-13 00:48:08"}
+{"event": "api_call", "target": "_fetch_user_artworks_sync", "timeout": 60.0, "args": ["<pixivpy3.aapi.AppPixivAPI object at 0x000001E2F6FCBCB0>", "106029976"], "kwargs": {}, "ts": "2026-04-13 02:03:03"}
+{"event": "api_call", "target": "illust_related", "timeout": 20.0, "args": [], "kwargs": {"illust_id": "61137987", "filter": "for_ios", "seed_illust_ids": "['61137987']", "viewed": "['60954305']"}, "ts": "2026-04-13 02:31:56"}
+{"event": "api_call", "target": "_fetch_ranking", "timeout": 60.0, "args": ["<pixivpy3.aapi.AppPixivAPI object at 0x000001E2F6FCBCB0>", "day_female"], "kwargs": {}, "ts": "2026-04-13 03:33:11"}
+{"event": "api_call", "target": "_fetch_user_artworks_sync", "timeout": 60.0, "args": ["<pixivpy3.aapi.AppPixivAPI object at 0x000001E2F6FCBCB0>", "92247404"], "kwargs": {}, "ts": "2026-04-13 03:48:29"}
+{"event": "api_call", "target": "illust_related", "timeout": 20.0, "args": [], "kwargs": {"illust_id": "43602731", "filter": "for_ios", "seed_illust_ids": "['93144128']", "viewed": "['93144128']"}, "ts": "2026-04-13 04:21:12"}
+{"event": "api_call", "target": "illust_detail", "timeout": 60.0, "args": ["97888223"], "kwargs": {}, "ts": "2026-04-13 06:10:48"}
+{"event": "api_call", "target": "illust_detail", "timeout": 60.0, "args": ["85095001"], "kwargs": {}, "ts": "2026-04-13 08:21:38"}
+{"event": "api_call", "target": "illust_detail", "timeout": 60.0, "args": ["74662216"], "kwargs": {}, "ts": "2026-04-13 08:21:38"}
+{"event": "api_call", "target": "illust_detail", "timeout": 60.0, "args": ["89606904"], "kwargs": {}, "ts": "2026-04-13 08:21:38"}
+{"event": "api_call", "target": "_fetch_ranking", "timeout": 60.0, "args": ["<pixivpy3.aapi.AppPixivAPI object at 0x000001E2F6FCBCB0>", "week"], "kwargs": {}, "ts": "2026-04-13 08:21:38"}
+{"event": "api_call", "target": "_fetch_user_artworks_sync", "timeout": 60.0, "args": ["<pixivpy3.aapi.AppPixivAPI object at 0x000001E2F6FCBCB0>", "66968203"], "kwargs": {}, "ts": "2026-04-13 10:19:39"}
+{"event": "api_call", "target": "illust_related", "timeout": 20.0, "args": [], "kwargs": {"illust_id": "5304685", "filter": "for_ios", "seed_illust_ids": "['5304685']", "viewed": "['31539958']"}, "ts": "2026-04-13 12:14:51"}
+{"event": "api_call", "target": "_fetch_recommended", "timeout": 60.0, "args": ["<pixivpy3.aapi.AppPixivAPI object at 0x000001E2F6FCBCB0>"], "kwargs": {}, "ts": "2026-04-13 18:05:32"}
+{"event": "api_call", "target": "_fetch_user_artworks_sync", "timeout": 60.0, "args": ["<pixivpy3.aapi.AppPixivAPI object at 0x000001E2F6FCBCB0>", "45452261"], "kwargs": {}, "ts": "2026-04-13 21:31:49"}
+{"event": "api_call", "target": "illust_related", "timeout": 20.0, "args": [], "kwargs": {"illust_id": "75378150"}, "ts": "2026-04-14 04:49:31"}
+{"event": "api_call", "target": "illust_related", "timeout": 20.0, "args": [], "kwargs": {"illust_id": "88440223", "filter": "for_ios", "seed_illust_ids": "['88440223']", "viewed": "['116614226']"}, "ts": "2026-04-14 04:50:33"}
+{"event": "api_call", "target": "illust_related", "timeout": 20.0, "args": [], "kwargs": {"illust_id": "70614060"}, "ts": "2026-04-14 06:00:22"}
+{"event": "api_call", "target": "_fetch_user_artworks_sync", "timeout": 60.0, "args": ["<pixivpy3.aapi.AppPixivAPI object at 0x0000018C24FB6850>", "14552", "<unlocked _thread.lock object at 0x0000018C9E35E190>"], "kwargs": {}, "ts": "2026-04-14 06:30:26"}
+{"event": "api_call", "target": "illust_detail", "timeout": 60.0, "args": ["135645619"], "kwargs": {}, "ts": "2026-04-14 07:53:01"}
+{"event": "api_call", "target": "illust_related", "timeout": 20.0, "args": [], "kwargs": {"illust_id": "11824306", "filter": "for_ios", "seed_illust_ids": "['11258930']", "viewed": "['11258930']"}, "ts": "2026-04-14 13:02:13"}

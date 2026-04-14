@@ -128,14 +128,12 @@ def _init_rate_limiter() -> None:
 # 進度 hook：每 _HOOK_INTERVAL 筆（新增+失敗+跳過）呼叫一次
 _progress_hook: "Callable[[dict], None] | None" = None
 _HOOK_INTERVAL: int = 5
-_fully_indexed_ids_cache: set[int] | None = None
-_cache_lock = threading.Lock()
 _priority_user_queue: "deque[int]" = deque()
 _priority_user_ids: set[int] = set()
 _priority_lock = threading.Lock()
 _priority_user_done_hook: "Callable[[dict], None] | None" = None
 _page_log_lock = threading.Lock()
-_PAGE_LOG_MAX_LINES = 20000
+_PAGE_LOG_MAX_LINES = 5000
 _tag_request_lock = threading.Lock()
 _tag_progress_lock = threading.Lock()
 _tag_progress: dict[str, dict] = {}   # key: "tag::sort", value: {page, done, chosen_query, chosen_sort, ts}
@@ -296,6 +294,44 @@ def _get_last_processed_tag() -> "str | None":
     return max(entries, key=lambda k: entries[k]["ts"])
 
 
+# ──────────────────────────────────────────────
+# Ranking 每日執行狀態（避免同一天重複插入任務）
+# ──────────────────────────────────────────────
+
+def _today_ymd() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
+def _load_ranking_state() -> dict:
+    path = getattr(config, "RANKING_LAST_RUN_FILE", "")
+    if not path:
+        return {"date": None, "done_modes": []}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        date = data.get("date")
+        done_modes = data.get("done_modes") or []
+        if not isinstance(done_modes, list):
+            done_modes = []
+        return {"date": date, "done_modes": [str(m) for m in done_modes]}
+    except FileNotFoundError:
+        return {"date": None, "done_modes": []}
+    except Exception as e:
+        logger.warning(f"[ranking] 載入每日狀態失敗: {e}")
+        return {"date": None, "done_modes": []}
+
+
+def _save_ranking_state(state: dict) -> None:
+    path = getattr(config, "RANKING_LAST_RUN_FILE", "")
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"[ranking] 儲存每日狀態失敗: {e}")
+
+
 async def _to_thread_with_timeout(func, *args, timeout: float | None = None, **kwargs):
     timeout = getattr(config, "PIXIV_API_TIMEOUT", 60.0) if timeout is None else timeout
     try:
@@ -327,32 +363,10 @@ def set_priority_user_done_hook(hook: "Callable[[dict], None] | None") -> None:
     _priority_user_done_hook = hook
 
 
-def _reset_fully_indexed_cache() -> None:
-    global _fully_indexed_ids_cache
-    with _cache_lock:
-        _fully_indexed_ids_cache = None
-
-
-def _load_fully_indexed_cache() -> set[int]:
-    global _fully_indexed_ids_cache
-    with _cache_lock:
-        if _fully_indexed_ids_cache is None:
-            _fully_indexed_ids_cache = db.get_all_fully_indexed_artwork_ids()
-            logger.info(f"已載入完整索引快取 {len(_fully_indexed_ids_cache)} 筆")
-        return set(_fully_indexed_ids_cache)
-
-
-def _is_cached_fully_indexed(illust_id: int) -> bool:
-    with _cache_lock:
-        if _fully_indexed_ids_cache is not None:
-            return illust_id in _fully_indexed_ids_cache
-    return illust_id in db.get_all_fully_indexed_artwork_ids()
-
-
-def _mark_artwork_fully_indexed(illust_id: int) -> None:
-    with _cache_lock:
-        if _fully_indexed_ids_cache is not None:
-            _fully_indexed_ids_cache.add(illust_id)
+def _maybe_emit_progress(counters: dict) -> None:
+    processed = counters.get("downloaded", 0) + counters.get("failed", 0) + counters.get("skipped", 0)
+    if _progress_hook and processed > 0 and processed % _HOOK_INTERVAL == 0:
+        _progress_hook(dict(counters))
 
 
 def enqueue_priority_user(user_id: int) -> bool:
@@ -664,6 +678,10 @@ def _fetch_ranking(api: AppPixivAPI, mode: str) -> list[dict]:
         artworks.extend(page_items)
         has_next = bool(result.get("next_url"))
         _log_page_fetch(f"ranking:{mode}", page, offset=offset, items=len(page_items), next_url=has_next)
+        logger.info(
+            f"[ranking] {mode} 第 {page} 頁｜本頁 {len(page_items)} 件，累計 {len(artworks)} 件"
+            + ("" if has_next else "  ← 最後一頁")
+        )
         if not has_next:
             break
         offset += 30
@@ -826,6 +844,12 @@ def _fetch_tag(
                     extra={"query": chosen_query, "effective_sort": chosen_sort,
                            "via": "ajax", "client": session_kind},
                 )
+                limit_str = f"/{max_pages}" if max_pages is not None else ""
+                logger.info(
+                    f"[tag] 「{tag}」{sort} "
+                    f"第 {page} 頁{limit_str}｜本頁 {len(page_items)} 件，累計 {len(artworks)} 件"
+                    + ("" if has_next else "  ← 最後一頁")
+                )
 
             return artworks, is_done, last_success_page, chosen_query, chosen_sort
 
@@ -880,6 +904,8 @@ async def _fetch_related_async(api: AppPixivAPI, illust_id: int) -> list[dict]:
     except Exception:
         return artworks
 
+    max_related_pages = int(getattr(config, "RELATED_MAX_PAGES", 100))
+
     while result and "illusts" in result:
         if not result["illusts"]:
             _log_page_fetch(f"related:{illust_id}", page, items=0, next_url=False, status="empty")
@@ -890,6 +916,9 @@ async def _fetch_related_async(api: AppPixivAPI, illust_id: int) -> list[dict]:
         has_next = bool(next_url)
         _log_page_fetch(f"related:{illust_id}", page, items=len(page_items), next_url=has_next)
         if not has_next:
+            break
+        if page >= max_related_pages:
+            _log_page_fetch(f"related:{illust_id}", page, items=0, next_url=True, status="limit")
             break
 
         await asyncio.sleep(config.FULL_CRAWL_API_DELAY)
@@ -1122,13 +1151,6 @@ async def _download_artwork_async(
     illust_id = artwork["illust_id"]
 
     try:
-        if _is_cached_fully_indexed(illust_id):
-            counters["skipped"] += 1
-            # 跳過時只做輕量的作者發現（不加入 related_diff_q 以免爆炸性增長）
-            if on_skip:
-                on_skip(artwork)
-            return
-
         urls = await _ensure_gallery_urls(api, artwork, api_sem)
         if not urls:
             counters["failed"] += 1
@@ -1203,7 +1225,6 @@ async def _download_artwork_async(
                     db.upsert_features(illust_id, first_phash)
 
             await asyncio.to_thread(_persist)
-            _mark_artwork_fully_indexed(illust_id)
             counters["downloaded"] += 1
             logger.info(f"已處理 {illust_id} | {artwork['title'][:40]}")
             if on_success:
@@ -1214,9 +1235,7 @@ async def _download_artwork_async(
         logger.warning(f"處理作品失敗 {illust_id}: {e}")
 
     finally:
-        processed = counters["downloaded"] + counters["failed"] + counters["skipped"]
-        if _progress_hook and processed > 0 and processed % _HOOK_INTERVAL == 0:
-            _progress_hook(dict(counters))
+        _maybe_emit_progress(counters)
 
 
 async def _process_batch_async(
@@ -1232,25 +1251,87 @@ async def _process_batch_async(
     api_sem: "asyncio.Semaphore | None" = None,
     on_skip: "Callable[[dict], None] | None" = None,
 ) -> None:
-    """並行處理一批作品，全部完成後才回傳"""
-    tasks = [
-        _download_artwork_async(
-            api,
-            session,
-            aw,
-            sem,
-            stop_event,
-            counters,
-            on_success=on_success,
-            api_sem=api_sem,
-            on_skip=on_skip,
-        )
-        for aw in artworks
-    ]
-    if tasks:
-        await asyncio.gather(*tasks)
+    """有界並發處理：用 queue + N worker 限制同時在飛的 task 數 = DOWNLOAD_WORKERS。
+    舊的 asyncio.gather(*全部tasks) 會讓數千個 coroutine 同時競搶 api_detail_sem，
+    造成長達數十分鐘的卡頓，改用此模式後同時活躍的 task 數 ≤ DOWNLOAD_WORKERS。
+    """
+    if not artworks:
+        if status_callback:
+            status_callback(counters, total_artworks or 0, False)
+        return
+
+    batch_total = total_artworks or len(artworks)
+
+    # 跨來源/跨頁去重：避免同一作品被排入多次造成重複下載
+    uniq: list[dict] = []
+    seen_ids: set[int] = set()
+    for aw in artworks:
+        iid = aw.get("illust_id")
+        if not iid:
+            continue
+        iid = int(iid)
+        if iid in seen_ids:
+            continue
+        seen_ids.add(iid)
+        uniq.append(aw)
+    artworks = uniq
+
+    # 不再載入「全部 fully-indexed IDs」到記憶體；改為每批次用 DB 批次查詢
+    # 避免長時間運行時快取無限制膨脹，也能保持準確（依 page_count / MAX_GALLERY_PAGES 判斷）
+    chunk_size = int(getattr(config, "FULLY_INDEXED_QUERY_CHUNK_SIZE", 800))
+    if chunk_size < 50:
+        chunk_size = 50
+    if chunk_size > 900:
+        chunk_size = 900
+
+    filtered: list[dict] = []
+    for i in range(0, len(artworks), chunk_size):
+        if stop_event.is_set():
+            break
+        chunk = artworks[i:i + chunk_size]
+        requirements = {
+            int(aw["illust_id"]): int(aw.get("page_count") or 1)
+            for aw in chunk
+            if aw.get("illust_id")
+        }
+        fully_indexed_ids = await asyncio.to_thread(db.get_fully_indexed_artwork_ids, requirements)
+        for aw in chunk:
+            iid = int(aw["illust_id"])
+            if iid in fully_indexed_ids:
+                counters["skipped"] += 1
+                if on_skip:
+                    on_skip(aw)
+                _maybe_emit_progress(counters)
+            else:
+                filtered.append(aw)
+
+    artworks = filtered
+    if not artworks:
+        if status_callback:
+            status_callback(counters, batch_total, False)
+        return
+
+    n_workers = config.DOWNLOAD_WORKERS
+    q: asyncio.Queue = asyncio.Queue()
+    for aw in artworks:
+        q.put_nowait(aw)
+
+    async def _worker() -> None:
+        while True:
+            try:
+                aw = q.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if stop_event.is_set():
+                return
+            await _download_artwork_async(
+                api, session, aw, sem, stop_event, counters,
+                on_success=on_success, api_sem=api_sem, on_skip=on_skip,
+            )
+
+    await asyncio.gather(*[_worker() for _ in range(n_workers)])
     if status_callback:
-        status_callback(counters, total_artworks or len(artworks), False)
+        status_callback(counters, batch_total, False)
 
 
 #──────────────────────────────────────────────
@@ -1381,12 +1462,11 @@ async def _run_full_crawl_async(
         related_diff_q.put_nowait(iid)
         skip_related_budget["count"] += 1
 
-    # ── 非 tag 種子（全站最新 / 排行 / 推薦）────────────────────────
+    # ── 非 tag 種子（全站最新 / 推薦）────────────────────────
+    # 排行榜已移入 tag 輪詢的奇數輪次（tag→user_scan→tag→ranking→user_scan）
     def _non_tag_sources():
         yield _fetch_new_illusts, api, "illust"
         yield _fetch_new_illusts, api, "manga"
-        for mode in config.ALL_RANKING_MODES:
-            yield _fetch_ranking, api, mode
         yield _fetch_recommended, api
 
     # 載入 tag 爬取進度（爬蟲重啟後從記錄點繼續）
@@ -1411,7 +1491,12 @@ async def _run_full_crawl_async(
         )
         dl_session = aiohttp.ClientSession(headers=dl_headers, connector=connector)
 
+        # 背景處理 task 列表：tag/ranking 的作品下載在背景進行，主循環不等待
+        _bg_tasks: list[asyncio.Task] = []
+        _MAX_BG_TASKS = 3  # 最多同時 3 個背景下載批次，避免記憶體爆炸
+
         async def _process(artworks: list[dict]) -> None:
+            """立即等待（用於 diffusion / priority 等小批次）"""
             if artworks:
                 await _process_batch_async(
                     api, dl_session, artworks, counters, stop_event, download_sem,
@@ -1419,6 +1504,49 @@ async def _run_full_crawl_async(
                     on_skip=_on_artwork_skip,
                     api_sem=api_detail_sem,
                 )
+
+        async def _process_bg(artworks: list[dict], label: str = "") -> None:
+            """將大批作品丟入背景 task，主循環立即繼續。
+            若背景 task 已達上限，等最舊的一個完成後再繼續。"""
+            nonlocal _bg_tasks
+            if not artworks:
+                return
+            # 清掉已完成的
+            _bg_tasks = [t for t in _bg_tasks if not t.done()]
+            # 若達上限，等最舊的完成
+            if len(_bg_tasks) >= _MAX_BG_TASKS:
+                logger.info(f"[bg] 背景佇列已滿（{len(_bg_tasks)}），等待最舊批次完成...")
+                _log_page_fetch("phase:bg_wait", 0, status="wait",
+                                extra={"pending": len(_bg_tasks), "label": label})
+                await _bg_tasks[0]
+                _bg_tasks = [t for t in _bg_tasks if not t.done()]
+
+            async def _run():
+                _log_page_fetch("phase:processing", 0, status="bg_start",
+                                extra={"from": label, "artworks": len(artworks)})
+                await _process_batch_async(
+                    api, dl_session, artworks, counters, stop_event, download_sem,
+                    on_success=_on_artwork_success,
+                    on_skip=_on_artwork_skip,
+                    api_sem=api_detail_sem,
+                )
+                _log_page_fetch("phase:processing", 0, status="bg_done",
+                                extra={"from": label, "artworks": len(artworks)})
+
+            task = asyncio.create_task(_run())
+            _bg_tasks.append(task)
+            logger.info(f"[bg] 已排程背景處理 {len(artworks)} 件（{label}），目前背景批次={len(_bg_tasks)}）")
+
+        async def _await_bg_tasks() -> None:
+            """等待所有背景處理完成（round 結尾前呼叫）"""
+            nonlocal _bg_tasks
+            pending = [t for t in _bg_tasks if not t.done()]
+            if pending:
+                logger.info(f"[bg] 等待 {len(pending)} 個背景批次完成...")
+                _log_page_fetch("phase:bg_flush", 0, status="wait", extra={"pending": len(pending)})
+                await asyncio.gather(*pending, return_exceptions=True)
+                _log_page_fetch("phase:bg_flush", 0, status="done")
+            _bg_tasks = []
 
         async def _drain_priority() -> None:
             while not stop_event.is_set():
@@ -1459,51 +1587,51 @@ async def _run_full_crawl_async(
             user_budget: int | None = None,
             related_budget: int | None = None,
         ) -> tuple[int, int]:
-            """Drain diffusion queues with budgets to avoid starving seed/tag crawling."""
+            """每次 tick 最多消耗 user_budget 個作者 + related_budget 個相關，
+            預算耗盡立即返回主循環，絕不無限擴散。"""
+            # 預算為 None 時用保守預設值，避免意外無上限執行
+            if user_budget is None:
+                user_budget = int(getattr(config, "DIFFUSION_USER_QUOTA_PER_TICK", 5))
+            if related_budget is None:
+                related_budget = int(getattr(config, "DIFFUSION_RELATED_QUOTA_PER_TICK", 5))
+
             user_done = 0
             related_done = 0
-            while not stop_event.is_set() and not user_diff_q.empty():
-                # Priority authors should preempt diffusion work immediately.
+
+            # 交替消耗：1 user → 1 related → 1 user → ...，預算耗盡即返回
+            while not stop_event.is_set():
                 if get_priority_queue_size() > 0:
                     break
-                if user_budget is not None and user_done >= user_budget:
-                    break
-                uid = user_diff_q.get_nowait()
-                try:
-                    artworks = await _to_thread_with_timeout(_fetch_user_artworks_sync, api, uid)
-                    logger.info(f"[擴散-作者] user={uid} → {len(artworks)} 件")
-                except Exception as e:
-                    logger.warning(f"[擴散-作者] 失敗 user={uid}: {e}")
-                    artworks = []
-                await _process(artworks)
-                user_done += 1
-                if related_budget is None or related_done < related_budget:
-                    related_done += await _drain_related(max_items=1)
+                did_something = False
 
-            if related_budget is None:
-                related_done += await _drain_related()
-            else:
-                related_done += await _drain_related(max_items=max(0, related_budget - related_done))
+                if user_done < user_budget and not user_diff_q.empty():
+                    uid = user_diff_q.get_nowait()
+                    try:
+                        aw = await _to_thread_with_timeout(_fetch_user_artworks_sync, api, uid)
+                        logger.info(f"[擴散-作者] user={uid} → {len(aw)} 件")
+                    except Exception as e:
+                        logger.warning(f"[擴散-作者] 失敗 user={uid}: {e}")
+                        aw = []
+                    await _process(aw)
+                    user_done += 1
+                    did_something = True
+
+                if related_done < related_budget and not related_diff_q.empty():
+                    iid = related_diff_q.get_nowait()
+                    try:
+                        aw = await _fetch_related_async(api, iid)
+                        logger.info(f"[擴散-相關] illust={iid} → {len(aw)} 件")
+                    except Exception as e:
+                        logger.warning(f"[擴散-相關] 失敗 illust={iid}: {e}")
+                        aw = []
+                    await _process(aw)
+                    related_done += 1
+                    did_something = True
+
+                if not did_something:
+                    break  # 兩個佇列都空了
+
             return user_done, related_done
-
-        async def _drain_related(max_items: int | None = None) -> int:
-            done = 0
-            while not stop_event.is_set() and not related_diff_q.empty():
-                # Priority authors should preempt diffusion work immediately.
-                if get_priority_queue_size() > 0:
-                    break
-                if max_items is not None and done >= max_items:
-                    break
-                iid = related_diff_q.get_nowait()
-                try:
-                    artworks = await _fetch_related_async(api, iid)
-                    logger.info(f"[擴散-相關] illust={iid} → {len(artworks)} 件")
-                except Exception as e:
-                    logger.warning(f"[擴散-相關] 失敗 illust={iid}: {e}")
-                    artworks = []
-                await _process(artworks)
-                done += 1
-            return done
 
         async def _priority_watcher() -> None:
             """
@@ -1562,8 +1690,8 @@ async def _run_full_crawl_async(
             tags_to_process = active_tags[:config.TAGS_PER_ROUND]
 
             # ── tag → user_scan 交替主迴圈 ───────────────────────────────
-            # 每個 tag 抓 max_tag_pages 頁後，觸發一次 user_scan 批次
-            for tag, sort in tags_to_process:
+            # 循環順序：tag(100頁) → user_scan → tag(100頁) → ranking → user_scan → 重複
+            for tag_idx, (tag, sort) in enumerate(tags_to_process):
                 if stop_event.is_set():
                     break
                 await _drain_priority()
@@ -1574,6 +1702,13 @@ async def _run_full_crawl_async(
                 start_page = last_p + 1 if last_p > 0 else 1
                 resume_q = progress.get("chosen_query")
                 resume_s = progress.get("chosen_sort")
+
+                phase_label = "tag→user_scan" if tag_idx % 2 == 0 else "tag→ranking→user_scan"
+                total_tags = len(tags_to_process)
+                logger.info(
+                    f"[tag {tag_idx + 1}/{total_tags}] 開始: 「{tag}」{sort} "
+                    f"從第 {start_page} 頁（最多 {max_tag_pages} 頁）【{phase_label}】"
+                )
 
                 try:
                     # _fetch_tag 是多頁長跑任務，每頁 HTTP request 已有自己的 timeout；
@@ -1595,23 +1730,124 @@ async def _run_full_crawl_async(
                         await asyncio.gather(_pulse_task, return_exceptions=True)
                     _update_tag_progress(tag, sort, last_page, is_done, eff_q, eff_s)
                     _save_tag_progress()
+                    tag_status = "done" if is_done else "paused"
                     logger.info(
-                        f"[tag] {tag}:{sort} p{start_page}-{last_page} "
-                        f"{'完成' if is_done else '暫停'} → {len(artworks)} 件"
+                        f"[tag {tag_idx + 1}/{total_tags}] 完成: 「{tag}」{sort} "
+                        f"p{start_page}→{last_page} {'✓全部完成' if is_done else '⏸暫停(達上限)'} "
+                        f"→ {len(artworks)} 件"
+                    )
+                    _log_page_fetch(
+                        f"phase:tag_done", 0,
+                        status=tag_status,
+                        extra={"tag": tag, "sort": sort,
+                               "pages_fetched": last_page - start_page + 1,
+                               "artworks": len(artworks),
+                               "next": "ranking" if tag_idx % 2 == 1 else "user_scan"},
                     )
                 except Exception as e:
-                    logger.warning(f"[tag] {tag}:{sort} 失敗: {e}")
+                    logger.warning(f"[tag {tag_idx + 1}/{total_tags}] 「{tag}」{sort} 失敗: {e}")
                     artworks = []
+                    _log_page_fetch("phase:tag_done", 0, status="error",
+                                    extra={"tag": tag, "sort": sort, "error": str(e)})
 
-                await _process(artworks)
-                await _drain_priority()
-                await _drain_diffusion(
-                    user_budget=diffusion_user_quota,
-                    related_budget=diffusion_related_quota,
-                )
+                # ── 循環順序：tag → [ranking] → user_scan → process ──────────
+                # user_scan 移至 process 之前，確保 page_log 立即出現切換記錄，
+                # 而不是等數十分鐘的圖片下載完才出現。
 
-                # ── 每個 tag 後執行 user_scan 批次 ──────────────────────
+                # ── 奇數輪次（1, 3, 5...）：先爬排行榜再 user_scan ──────────
+                if tag_idx % 2 == 1 and not stop_event.is_set():
+                    today = _today_ymd()
+                    state = _load_ranking_state()
+                    if state.get("date") != today:
+                        state = {
+                            "date": today,
+                            "done_modes": [],
+                            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+                        _save_ranking_state(state)
+
+                    done_modes = set(state.get("done_modes") or [])
+                    remaining_modes = [m for m in config.ALL_RANKING_MODES if m not in done_modes]
+                    if not remaining_modes:
+                        logger.info(f"[ranking] 今日({today})已執行過，跳過排行榜任務插入")
+                        _log_page_fetch(
+                            "phase:ranking_skip",
+                            0,
+                            status="skip",
+                            extra={
+                                "reason": "already_ran_today",
+                                "date": today,
+                                "after_tag": f"{tag}:{sort}",
+                                "done_modes": list(done_modes),
+                            },
+                        )
+                    else:
+                        n_ranking = len(remaining_modes)
+                        logger.info(
+                            f"[ranking] ── 開始排行榜爬取（{n_ranking} 種模式 / 每日一次）"
+                            f"【tag {tag_idx + 1}/{total_tags} 之後，date={today}】"
+                        )
+                        _log_page_fetch(
+                            "phase:ranking_start",
+                            0,
+                            status="start",
+                            extra={
+                                "date": today,
+                                "modes": remaining_modes,
+                                "after_tag": f"{tag}:{sort}",
+                                "done_modes": list(done_modes),
+                            },
+                        )
+
+                    for r_idx, mode in enumerate(remaining_modes, 1):
+                        if stop_event.is_set():
+                            break
+                        await _drain_priority()
+                        logger.info(f"[ranking {r_idx}/{n_ranking}] 模式: {mode}")
+                        _log_page_fetch("phase:ranking", 0, status="start",
+                                        extra={"mode": mode, "idx": r_idx, "total": n_ranking})
+                        try:
+                            ranking_artworks = await _to_thread_with_timeout(_fetch_ranking, api, mode)
+                            logger.info(f"[ranking {r_idx}/{n_ranking}] {mode} 完成 → {len(ranking_artworks)} 件")
+                        except Exception as e:
+                            logger.warning(f"[ranking {r_idx}/{n_ranking}] {mode} 失敗: {e}")
+                            ranking_artworks = []
+                        _log_page_fetch("phase:ranking", 0, status="done",
+                                        extra={"mode": mode, "artworks": len(ranking_artworks)})
+                        # ranking 結果先收集，之後和 tag 結果一起處理
+                        artworks.extend(ranking_artworks)
+                        try:
+                            if mode not in done_modes:
+                                done_modes.add(mode)
+                                state["done_modes"] = list(done_modes)
+                                state["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                                _save_ranking_state(state)
+                        except Exception:
+                            pass
+
+                # ── user_scan（在 process 之前執行，確保 log 立即可見）──────
+                if not scan_api and not stop_event.is_set():
+                    # scan_api 為 None 時嘗試重新初始化一次
+                    try:
+                        scan_api = await asyncio.to_thread(_setup_api)
+                        scan_dl_headers = _get_dl_headers(scan_api)
+                        logger.info("[user_scan] scan_api 重新初始化成功")
+                    except Exception as e:
+                        logger.warning(f"[user_scan] scan_api 初始化失敗，本輪跳過: {e}")
+                        _log_page_fetch("phase:user_scan_skip", 0, status="skip",
+                                        extra={"reason": str(e), "after": f"tag:{tag}:{sort}"})
+
                 if scan_api and not stop_event.is_set():
+                    cursor_before = _load_scan_cursor()
+                    logger.info(
+                        f"[user_scan] ── 開始 ID 順序掃描（{user_batch_size} 個 ID）"
+                        f"，cursor={cursor_before}"
+                        f"【tag {tag_idx + 1}/{total_tags}"
+                        f"{' + ranking' if tag_idx % 2 == 1 else ''} 之後】"
+                    )
+                    _log_page_fetch("phase:user_scan_start", 0, status="start",
+                                    extra={"cursor": cursor_before, "batch_size": user_batch_size,
+                                           "after": f"tag:{tag}:{sort}" + ("+ranking" if tag_idx % 2 == 1 else "")})
                     await _scan_user_batch_async(
                         scan_api,
                         scan_dl_headers or {},
@@ -1621,25 +1857,35 @@ async def _run_full_crawl_async(
                         on_success=_on_artwork_success,
                         main_api=api,
                     )
-                    await _drain_priority()
-                    await _drain_diffusion(
-                        user_budget=diffusion_user_quota,
-                        related_budget=diffusion_related_quota,
-                    )
+                    cursor_after = _load_scan_cursor()
+                    _log_page_fetch("phase:user_scan_done", 0, status="done",
+                                    extra={"cursor_start": cursor_before, "cursor_end": cursor_after})
 
-            # ── 非 tag 種子（最新上傳 / 排行榜 / 推薦）────────────────────
+                # ── process：tag + ranking 合併後的作品（背景執行，不阻塞主循環）──
+                await _drain_priority()
+                await _process_bg(artworks, label=f"tag:{tag}:{sort}")
+                # diffusion 仍用小批次立即執行（資料量小，可接受）
+                await _drain_diffusion(
+                    user_budget=diffusion_user_quota,
+                    related_budget=diffusion_related_quota,
+                )
+                await _drain_priority()
+
+            # ── 非 tag 種子（最新上傳 / 推薦）────────────────────
+            logger.info("[種子] ── 開始非 tag 種子爬取（最新上傳 / 推薦）")
             for fetch_fn, *args in _non_tag_sources():
                 if stop_event.is_set():
                     break
                 await _drain_priority()
+                label = f"{fetch_fn.__name__}({', '.join(str(a) for a in args[1:])})"
+                logger.info(f"[種子] 開始: {label}")
                 try:
                     artworks = await _to_thread_with_timeout(fetch_fn, *args)
-                    label = f"{fetch_fn.__name__}({', '.join(str(a) for a in args[1:])})"
-                    logger.info(f"[種子] {label} → {len(artworks)} 件")
+                    logger.info(f"[種子] 完成: {label} → {len(artworks)} 件")
                 except Exception as e:
                     logger.warning(f"[種子] 來源失敗: {e}")
                     artworks = []
-                await _process(artworks)
+                await _process_bg(artworks, label=label)
                 await _drain_priority()
                 await _drain_diffusion(
                     user_budget=diffusion_user_quota,
@@ -1656,6 +1902,9 @@ async def _run_full_crawl_async(
                 user_budget=diffusion_user_quota * diffusion_tail_multiplier,
                 related_budget=diffusion_related_quota * diffusion_tail_multiplier,
             )
+
+            # ── 等待所有背景下載完成後再統計、進入下一輪 ─────────────
+            await _await_bg_tasks()
 
             try:
                 s = db.stats()
@@ -1676,6 +1925,7 @@ async def _run_full_crawl_async(
         finally:
             _watcher_task.cancel()
             await asyncio.gather(_watcher_task, return_exceptions=True)
+            await _await_bg_tasks()   # stop 時也等背景完成
             await dl_session.close()
 
     logger.info("爬取結束，存檔 FAISS 索引...")
@@ -1820,14 +2070,12 @@ def run_full_crawl(stop_event: threading.Event) -> None:
     db.init_db()
     Path(config.IMAGES_DIR).mkdir(parents=True, exist_ok=True)
     fe.init_live_index()
-    _reset_fully_indexed_cache()
     if fe.get_index_size() == 0:
         logger.info("FAISS 索引為空，從 DB 重建（含多頁）...")
         try:
             fe.build_faiss_index()
         except RuntimeError:
             pass
-    _load_fully_indexed_cache()
 
     try:
         api = _setup_api()
@@ -1928,14 +2176,12 @@ def crawl_user_by_id(
     db.init_db()
     Path(config.IMAGES_DIR).mkdir(parents=True, exist_ok=True)
     fe.init_live_index()
-    _reset_fully_indexed_cache()
     if fe.get_index_size() == 0:
         logger.info("FAISS 索引為空，從 DB 重建（含多頁）...")
         try:
             fe.build_faiss_index()
         except RuntimeError:
             pass
-    _load_fully_indexed_cache()
 
     try:
         api = _setup_api()

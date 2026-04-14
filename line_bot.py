@@ -5,6 +5,7 @@ LINE Bot 模組：接收 LINE Webhook 事件，送入 msg_queue 讓 gemini_worke
 Webhook URL 請設定為：https://<your-domain>:<port>/webhook
 """
 import asyncio
+import time
 from aiohttp import web
 
 from config import LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET
@@ -25,6 +26,25 @@ try:
     _LINE_SDK_AVAILABLE = True
 except ImportError:
     _LINE_SDK_AVAILABLE = False
+
+
+_PENDING_IMAGE_TTL_SEC: float = 120.0
+_pending_line_images: dict[tuple[str, str], dict] = {}
+
+
+def _line_user_id(source) -> str | None:
+    return getattr(source, 'user_id', None)
+
+
+def _wants_image_followup(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return True
+    keywords = (
+        '看圖', '看這張', '這張圖', '圖片', '照片', '附圖',
+        'image', 'photo', 'pic', '圖',
+    )
+    return any(k in t for k in keywords)
 
 
 class _NullTyping:
@@ -95,6 +115,7 @@ async def _handle_webhook(
             continue
 
         source = event.source
+        user_id = _line_user_id(source)
         # 決定 session key 與 push target
         if source.type == 'user':
             push_to = source.user_id
@@ -120,13 +141,33 @@ async def _handle_webhook(
                 continue
             prompt = prompt.replace('@小龍喵', '').strip()
 
+            # 若文字看起來是在「呼叫我看圖」，先記錄並等待下一則圖片（避免這則就觸發 AI）
+            if user_id and _wants_image_followup(prompt):
+                _pending_line_images[(cid, user_id)] = {
+                    'ts': time.time(),
+                    'prompt': prompt or '請描述這個附件的內容。',
+                }
+                continue
+
         elif isinstance(event.message, ImageMessageContent):
+            # 只有在使用者先 @小龍喵 後才處理圖片（避免一般聊天/刷圖也觸發 AI）
+            if not user_id:
+                continue
+            key = (cid, user_id)
+            pending = _pending_line_images.get(key)
+            if not pending:
+                continue
+            if time.time() - float(pending.get('ts', 0)) > _PENDING_IMAGE_TTL_SEC:
+                _pending_line_images.pop(key, None)
+                continue
+            _pending_line_images.pop(key, None)
+
             try:
                 async with AsyncApiClient(config) as api_client:
                     blob_api = AsyncMessagingApiBlob(api_client)
                     image_bytes = await blob_api.get_message_content(event.message.id)
                 file_parts = [{'data': bytes(image_bytes), 'mime_type': 'image/jpeg'}]
-                prompt = '請描述這個附件的內容。'
+                prompt = str(pending.get('prompt') or '請描述這個附件的內容。')
             except Exception as e:
                 print(f'[LINE] 圖片下載失敗: {e}')
                 continue

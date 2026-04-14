@@ -4,3 +4,4 @@ data/bot.log
 __pycache__/
 *.pyc
 data/*
+pixivdata/*
