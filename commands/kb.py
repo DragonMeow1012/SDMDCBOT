@@ -11,7 +11,7 @@ from knowledge import (
     build_knowledge_context, load_knowledge,
 )
 from gemini_worker import analyze_for_kb
-from history import save_history
+from history import save_history_async
 import state
 
 
@@ -98,7 +98,7 @@ def setup(tree: app_commands.CommandTree) -> None:
         await interaction.response.defer(ephemeral=True)
         chat = sess['chat_obj']
         await asyncio.to_thread(chat.send_message, kb_ctx)
-        save_history(state.chat_sessions)
+        await save_history_async(state.chat_sessions)
         await interaction.followup.send(
             f'✅ 知識庫已重新載入並注入此頻道對話！（共 {len(state.knowledge_entries)} 筆）', ephemeral=True)
 

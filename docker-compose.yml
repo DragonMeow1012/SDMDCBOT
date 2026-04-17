@@ -1,10 +1,21 @@
 services:
   dcbot:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dcbot:latest
     container_name: dcbot
     env_file: .env
     restart: unless-stopped
     ports:
+      # LINE Bot webhook；可用 .env 覆寫：LINE_WEBHOOK_PORT=9090
       - "${LINE_WEBHOOK_PORT:-8080}:8080"
+      # Pixiv Streamlit 狀態頁
+      - "${STATUS_WEB_PORT:-8766}:8766"
     volumes:
+      # 持久化：聊天歷史、暱稱、知識庫、木魚功德…
       - ./data:/app/data
+      # 持久化：Pixiv 爬蟲資料（圖片 + SQLite + FAISS）
+      - ./pixivdata:/app/pixivdata
+    # Playwright chromium 需要較大的 shm（預設 64 MB 有時不夠）
+    shm_size: 512m

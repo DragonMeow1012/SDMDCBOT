@@ -9,6 +9,7 @@ from discord import app_commands
 
 from config import MASTER_ID
 from commands.whip import is_trainer_of
+from utils.discord_helpers import owner_only_button_check
 
 _MAX_SECONDS = 2419200   # Discord timeout 上限 28 天
 
@@ -35,8 +36,7 @@ class GagConfirmView(discord.ui.View):
 
     @discord.ui.button(label='同意', style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, _btn: discord.ui.Button):
-        if interaction.user.id != self.target.id:
-            await interaction.response.send_message('這不是你的確認按鈕喵！', ephemeral=True)
+        if not await owner_only_button_check(interaction, self.target.id):
             return
         err = await _apply_gag(self.target, self.seconds)
         msg = (err or f'{self.target.mention} 已戴上電子口球 {self.seconds} 秒！')
@@ -45,8 +45,7 @@ class GagConfirmView(discord.ui.View):
 
     @discord.ui.button(label='拒絕', style=discord.ButtonStyle.secondary)
     async def deny(self, interaction: discord.Interaction, _btn: discord.ui.Button):
-        if interaction.user.id != self.target.id:
-            await interaction.response.send_message('這不是你的確認按鈕喵！', ephemeral=True)
+        if not await owner_only_button_check(interaction, self.target.id):
             return
         await interaction.response.edit_message(
             content=f'{self.target.mention} 拒絕了電子口球！', view=None)

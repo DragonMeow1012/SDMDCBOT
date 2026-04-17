@@ -7,7 +7,7 @@ import math
 import asyncio
 import datetime
 
-import requests as _requests
+import aiohttp
 import numpy as np
 import networkx as nx
 import matplotlib
@@ -39,18 +39,16 @@ _FONT = _find_cjk_font()
 
 # ── 頭像處理 ──────────────────────────────────────────────────────────────────
 
-def _fetch_avatar(url: str, size: int = 128) -> np.ndarray | None:
-    """同步下載並裁切為圓形頭像，回傳 RGBA numpy array。"""
+def _bytes_to_circle_avatar(raw: bytes, size: int = 128) -> np.ndarray | None:
+    """將圖片 bytes 裁切為圓形頭像，回傳 RGBA numpy array。"""
     try:
-        resp = _requests.get(url, timeout=8)
-        resp.raise_for_status()
-        img = Image.open(io.BytesIO(resp.content)).convert('RGBA').resize((size, size))
+        img = Image.open(io.BytesIO(raw)).convert('RGBA').resize((size, size))
         mask = Image.new('L', (size, size), 0)
         ImageDraw.Draw(mask).ellipse((0, 0, size, size), fill=255)
         img.putalpha(mask)
         return np.array(img)
     except Exception as e:
-        print(f'[GRAPH] 頭像下載失敗: {e}')
+        print(f'[GRAPH] 頭像解析失敗: {e}')
         return None
 
 
@@ -58,7 +56,7 @@ async def _collect_members(
     guild: discord.Guild,
     uids: set[str],
 ) -> tuple[dict[str, str], dict[str, np.ndarray]]:
-    """非同步收集成員顯示名稱與頭像。"""
+    """非同步收集成員顯示名稱與頭像；使用 discord.Asset.read() 走原生 aiohttp。"""
     name_map:   dict[str, str]        = {}
     avatar_map: dict[str, np.ndarray] = {}
 
@@ -72,8 +70,12 @@ async def _collect_members(
         if not member:
             return
         name_map[uid] = member.display_name
-        url = str(member.display_avatar.replace(size=128).url)
-        arr = await asyncio.to_thread(_fetch_avatar, url)
+        try:
+            raw = await member.display_avatar.replace(size=128).read()
+        except (discord.HTTPException, aiohttp.ClientError) as e:
+            print(f'[GRAPH] 頭像下載失敗 uid={uid}: {e}')
+            return
+        arr = await asyncio.to_thread(_bytes_to_circle_avatar, raw)
         if arr is not None:
             avatar_map[uid] = arr
 

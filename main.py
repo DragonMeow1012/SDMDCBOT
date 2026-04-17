@@ -25,13 +25,13 @@ setup_logger()
 from config import DISCORD_TOKEN, MASTER_ID
 from history import load_history, save_history
 from web import fetch_url
-from gemini_worker import create_chat, msg_queue, gemini_worker
+from gemini_worker import msg_queue, gemini_worker
+from ai_session import ensure_session
 from nicknames import load_nicknames, build_all_nicknames_summary
 from knowledge import (
     load_knowledge, build_knowledge_context, consolidate_knowledge,
 )
 from reverse_search import reverse_image_search
-from summary import load_summary
 import state
 from commands import setup_all
 from commands.kb import handle_kb_command
@@ -66,43 +66,48 @@ _TEXT_EXTENSIONS: frozenset[str] = frozenset({
     '.sh', '.bat', '.c', '.cpp', '.h', '.java', '.go', '.rs', '.rb',
 })
 
+_MIME_BY_EXT: dict[str, str] = {
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp',
+    '.pdf': 'application/pdf',
+}
+
+# 預先編譯 hot-path 正規表達式，避免每次訊息都重建
+_URL_RE = re.compile(r'https?://[^\s\)\]\>\"\'`]+(?<![.,;:!?])')
+_KB_RE = re.compile(r'^!kb(\s|$)')
+
 
 def _is_source_query(text: str) -> bool:
-    return any(kw in text.lower() for kw in _SOURCE_KEYWORDS)
+    lowered = text.lower()
+    return any(kw in lowered for kw in _SOURCE_KEYWORDS)
 
 
 def _guess_mime(filename: str) -> str:
     ext = os.path.splitext(filename)[1].lower()
-    return {
-        '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-        '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp',
-        '.pdf': 'application/pdf',
-    }.get(ext, 'application/octet-stream')
+    return _MIME_BY_EXT.get(ext, 'application/octet-stream')
 
 
 def _is_text_file(filename: str) -> bool:
     return os.path.splitext(filename)[1].lower() in _TEXT_EXTENSIONS
 
 
+_MENTION_RE_CACHE: dict[int, re.Pattern[str]] = {}
+
+
 def _strip_bot_mention(text: str, bot_id: int) -> str:
-    # Discord mention 可能是 <@id> 或 <@!id>
-    return re.sub(rf'<@!?\s*{bot_id}\s*>', '', text).strip()
+    """移除訊息中對 Bot 的 @ 提及（<@id> 或 <@!id>）。"""
+    pat = _MENTION_RE_CACHE.get(bot_id)
+    if pat is None:
+        pat = re.compile(rf'<@!?\s*{bot_id}\s*>')
+        _MENTION_RE_CACHE[bot_id] = pat
+    return pat.sub('', text).strip()
 
 
 # ---------------------------------------------------------------------------
 # Session 初始化
 # ---------------------------------------------------------------------------
 def _init_session(cid: int, personality: str, sess: dict | None) -> None:
-    raw_history = sess.get('raw_history', []) if sess else []
-    web_context = sess.get('current_web_context') if sess else None
-    summary     = load_summary(cid)
-
-    state.chat_sessions[cid] = {
-        'chat_obj':           create_chat(personality, raw_history, summary),
-        'personality':        personality,
-        'raw_history':        raw_history,
-        'current_web_context': web_context,
-    }
+    ensure_session(state.chat_sessions, cid, personality, sess)
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +144,7 @@ async def on_message(msg: discord.Message) -> None:
     raw_text: str = _strip_bot_mention(msg.content, client.user.id)
 
     # !kb 指令攔截（不送 Gemini；不需要 @ 也能用）
-    if re.match(r'^!kb(\s|$)', raw_text):
+    if _KB_RE.match(raw_text):
         args = raw_text[3:].strip()
         await handle_kb_command(msg, args)
         return
@@ -223,7 +228,8 @@ async def on_message(msg: discord.Message) -> None:
         return
 
     # URL 偵測
-    if url_match := re.search(r'https?://[^\s\)\]\>\"\'`]+(?<![.,;:!?])', prompt):
+    sess = state.chat_sessions[cid]
+    if url_match := _URL_RE.search(prompt):
         url: str   = url_match.group(0)
         query: str = prompt.replace(url, '').strip()
 
@@ -234,7 +240,7 @@ async def on_message(msg: discord.Message) -> None:
         if content.startswith('錯誤:') or not content:
             print(f'[WEB] 抓取失敗: {url}')
         else:
-            state.chat_sessions[cid]['current_web_context'] = content
+            sess['current_web_context'] = content
             await msg.reply('喵嗚！已成功抓取網頁內容囉！')
             prompt = (
                 f'請簡潔摘要以下網頁內容：\n```\n{content}\n```\n原始網址：{url}'
@@ -242,7 +248,7 @@ async def on_message(msg: discord.Message) -> None:
                 f'以下是從網址 `{url}` 抓取到的內容：\n```\n{content}\n```\n請根據這些內容，回答我的問題：{query}'
             )
 
-    elif web_ctx := state.chat_sessions[cid].get('current_web_context'):
+    elif web_ctx := sess.get('current_web_context'):
         prompt = f'根據我之前讀取的內容：\n```\n{web_ctx}\n```\n請問：{prompt}'
 
     # 注入知識庫

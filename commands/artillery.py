@@ -2,30 +2,18 @@
 炮決指令：/炮決蘿莉控、/炮決排行、/清除炮決名單
 """
 import asyncio
-import json
 import os
 import random
 import discord
 from discord import app_commands
 
 from config import MASTER_ID
+from utils.json_store import load_json, save_json
+from utils.discord_helpers import format_leaderboard
 
 
 _ARTILLERY_FILE = os.path.join('data', 'artillery_records.json')
 _ARTILLERY_IMG  = os.path.join('picture', 'artillerylolicon.jpg')
-
-
-def _load_artillery() -> dict:
-    if os.path.exists(_ARTILLERY_FILE):
-        with open(_ARTILLERY_FILE, encoding='utf-8') as f:
-            return json.load(f)
-    return {}
-
-
-def _save_artillery(data: dict) -> None:
-    os.makedirs(os.path.dirname(_ARTILLERY_FILE), exist_ok=True)
-    with open(_ARTILLERY_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def setup(tree: app_commands.CommandTree) -> None:
@@ -68,10 +56,10 @@ def setup(tree: app_commands.CommandTree) -> None:
         # ── 更新紀錄 ────────────────────────────────────────────
         uid = str(victim.id)
         gid = str(guild.id)
-        records = _load_artillery()
+        records = load_json(_ARTILLERY_FILE)
         records.setdefault(gid, {})[uid] = records.get(gid, {}).get(uid, 0) + 1
         count = records[gid][uid]
-        _save_artillery(records)
+        save_json(_ARTILLERY_FILE, records)
 
         # ── 回覆訊息 ────────────────────────────────────────────
         text = (
@@ -95,26 +83,15 @@ def setup(tree: app_commands.CommandTree) -> None:
             await interaction.response.send_message('此指令只能在伺服器中使用！', ephemeral=True)
             return
 
-        records = _load_artillery()
+        records = load_json(_ARTILLERY_FILE)
         gid = str(guild.id)
         if gid not in records or not records[gid]:
             await interaction.response.send_message('還沒有人被炮決過喵！', ephemeral=True)
             return
 
-        top10 = sorted(records[gid].items(), key=lambda x: x[1], reverse=True)[:10]
-
         await interaction.response.defer()
-        lines = ['💀 **炮決排行榜** 💀']
-        for rank, (uid, cnt) in enumerate(top10, 1):
-            member = guild.get_member(int(uid))
-            if not member:
-                try:
-                    member = await guild.fetch_member(int(uid))
-                except discord.NotFound:
-                    pass
-            name = member.display_name if member else f'（已離開：{uid}）'
-            lines.append(f'`{rank}.` {name} — **{cnt}** 次')
-        await interaction.followup.send('\n'.join(lines))
+        text = await format_leaderboard(records[gid], guild, '💀 **炮決排行榜** 💀')
+        await interaction.followup.send(text)
 
     # ── 清除紀錄（主人限定） ────────────────────────────────────
     @tree.command(name="清除炮決名單", description="清除本伺服器的所有炮決記錄，無法復原。（主人限定）")
@@ -126,7 +103,7 @@ def setup(tree: app_commands.CommandTree) -> None:
         if guild is None:
             await interaction.response.send_message('此指令只能在伺服器中使用！', ephemeral=True)
             return
-        records = _load_artillery()
+        records = load_json(_ARTILLERY_FILE)
         records.pop(str(guild.id), None)
-        _save_artillery(records)
+        save_json(_ARTILLERY_FILE, records)
         await interaction.response.send_message('✅ 本伺服器的炮決名單已清除！', ephemeral=True)

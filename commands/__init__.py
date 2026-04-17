@@ -4,11 +4,12 @@ Commands 套件入口。
 """
 from discord import app_commands
 
-from commands import admin, nick, gag, fun, social, artillery, quote, search, kb, whip, wife, pixiv
+from commands import admin, nick, gag, fun, social, artillery, quote, search, kb, whip, wife, pixiv, ai
 
 
 def setup_all(tree: app_commands.CommandTree) -> None:
     admin.setup(tree)
+    ai.setup(tree)
     nick.setup(tree)
     gag.setup(tree)
     fun.setup(tree)

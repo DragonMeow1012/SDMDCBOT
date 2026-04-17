@@ -42,15 +42,22 @@ def _hist_to_lines(hist: list[dict]) -> list[str]:
 def save_summary(channel_id: int | str, hist: list[dict]) -> None:
     """
     將 hist（raw_history 格式）序列化為 TXT 並儲存。
-    只保留最後 MAX_LINES 條。
+    只保留最後 MAX_LINES 條，且總字數不超過 MAX_CHARS。
     """
     _ensure_dir()
-    lines = _hist_to_lines(hist)
-    lines = lines[-MAX_LINES:]
+    lines = _hist_to_lines(hist)[-MAX_LINES:]
 
-    # 字數上限：從最舊的開始刪，直到總字數 ≤ MAX_CHARS
-    while lines and sum(len(l) for l in lines) > MAX_CHARS:
-        lines.pop(0)
+    # 從尾端累計長度，反向找到可保留的起點，避免 O(n²) 的 pop(0) 迴圈
+    if lines:
+        total = 0
+        start = len(lines)
+        for i in range(len(lines) - 1, -1, -1):
+            total += len(lines[i])
+            if total > MAX_CHARS:
+                start = i + 1
+                break
+            start = i
+        lines = lines[start:]
 
     path = os.path.join(SUMMARIES_DIR, f"{channel_id}.txt")
     header = (

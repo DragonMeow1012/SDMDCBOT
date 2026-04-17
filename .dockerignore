@@ -1,9 +1,49 @@
+# ── 版本控制 ──────────────────────────────────
 .git
+.gitignore
+.gitattributes
+
+# ── Python 編譯快取 ───────────────────────────
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+.pycachetmp/
+
+# ── 虛擬環境（絕對不要放進 image，會讓 image 暴增）─
+.venv/
+venv/
+env/
+ENV/
+
+# ── 編輯器 / IDE ─────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ── 日誌與臨時檔 ───────────────────────────
 *.log
+*.log.*
+*.pid
+*.tmp
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── 本地資料（持久化由 compose volume 處理） ──
 data/
+pixivdata/
+
+# ── 機密 / 本地設定 ─────────────────────────
 .env
+.env.*
+!.env.example
+
+# ── 文件產物 ─────────────────────────────
+*.pdf
 README.pdf
+
+# ── Docker 本身 ─────────────────────────
+docker-compose.override.yml
+Dockerfile.*

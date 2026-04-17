@@ -2,11 +2,13 @@
 社交指令：/認養寵物、/認主人、/本群關係圖、/賽博釣群友、/分隊伍
 """
 import asyncio
-import json
 import os
 import random
 import discord
 from discord import app_commands
+
+from utils.json_store import load_json, save_json
+from utils.discord_helpers import owner_only_button_check
 
 
 _CHINESE_NUMS = ['一','二','三','四','五','六','七','八','九','十',
@@ -46,18 +48,6 @@ class TeamSignupView(discord.ui.View):
 _REL_FILE = os.path.join('data', 'relationships.json')
 
 
-def _load_rel() -> dict:
-    if os.path.exists(_REL_FILE):
-        with open(_REL_FILE, encoding='utf-8') as f:
-            return json.load(f)
-    return {}
-
-
-def _save_rel(data: dict) -> None:
-    with open(_REL_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
 
 class RelationView(discord.ui.View):
     """通用認養/認主人確認按鈕。mode: 'pet'=認養寵物, 'master'=認主人"""
@@ -71,11 +61,10 @@ class RelationView(discord.ui.View):
 
     @discord.ui.button(label='接受 ✅', style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, _btn: discord.ui.Button):
-        if interaction.user.id != self.target.id:
-            await interaction.response.send_message('這不是你的確認按鈕喵！', ephemeral=True)
+        if not await owner_only_button_check(interaction, self.target.id):
             return
 
-        data   = _load_rel()
+        data   = load_json(_REL_FILE)
         gid    = str(self.guild_id)
         req_id = str(self.requester.id)
         tgt_id = str(self.target.id)
@@ -89,14 +78,13 @@ class RelationView(discord.ui.View):
             data[gid][req_id] = tgt_id
             msg = f'🐾 {self.requester.mention} 成為了 {self.target.mention} 的寵物！'
 
-        _save_rel(data)
+        save_json(_REL_FILE, data)
         await interaction.response.edit_message(content=msg, view=None)
         self.stop()
 
     @discord.ui.button(label='拒絕 ❌', style=discord.ButtonStyle.secondary)
     async def deny(self, interaction: discord.Interaction, _btn: discord.ui.Button):
-        if interaction.user.id != self.target.id:
-            await interaction.response.send_message('這不是你的確認按鈕喵！', ephemeral=True)
+        if not await owner_only_button_check(interaction, self.target.id):
             return
         await interaction.response.edit_message(content='❌ 對方拒絕了喵。', view=None)
         self.stop()
@@ -255,7 +243,7 @@ def setup(tree: app_commands.CommandTree) -> None:
             )
             return
 
-        data = _load_rel()
+        data = load_json(_REL_FILE)
         gid  = str(guild.id)
         rels = data.get(gid, {})
         from commands.wife import get_active_wife_rels

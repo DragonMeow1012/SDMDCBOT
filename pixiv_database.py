@@ -4,15 +4,22 @@ Pixiv 鞈?摨急芋蝯?- SQLite ?脣???????孵噩??
 """
 import sqlite3
 import json
+import threading
 import numpy as np
 from pathlib import Path
 from typing import Optional
 import pixiv_config as config
 
+_local = threading.local()
+
 
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(config.DB_PATH)
-    conn.row_factory = sqlite3.Row
+    """取得 thread-local 的 SQLite 連線（避免每次呼叫都新建連線）。"""
+    conn = getattr(_local, 'conn', None)
+    if conn is None:
+        conn = sqlite3.connect(config.DB_PATH)
+        conn.row_factory = sqlite3.Row
+        _local.conn = conn
     return conn
 
 
@@ -167,21 +174,19 @@ def search_by_ids(illust_ids: list[int]) -> list[sqlite3.Row]:
 
 
 def stats() -> dict:
-    """統計作品與索引進度"""
+    """統計作品與索引進度（單次查詢取代 3 次獨立 COUNT）"""
     with get_connection() as conn:
-        total = conn.execute("SELECT COUNT(*) FROM artworks").fetchone()[0]
-        downloaded = conn.execute(
-            "SELECT COUNT(*) FROM features"
-        ).fetchone()[0]
-        gallery_pages = conn.execute(
-            "SELECT COUNT(*) FROM GalleryPixiv WHERE color_hist IS NOT NULL"
-        ).fetchone()[0]
-        indexed = downloaded
+        row = conn.execute("""
+            SELECT
+                (SELECT COUNT(*) FROM artworks) AS total,
+                (SELECT COUNT(*) FROM features) AS downloaded,
+                (SELECT COUNT(*) FROM GalleryPixiv WHERE color_hist IS NOT NULL) AS gallery_pages
+        """).fetchone()
     return {
-        "total": total,
-        "downloaded": downloaded,
-        "indexed": indexed,
-        "gallery_pages": gallery_pages,
+        "total": row[0],
+        "downloaded": row[1],
+        "indexed": row[1],
+        "gallery_pages": row[2],
     }
 
 def is_artwork_fully_indexed(illust_id: int, page_count: int) -> bool:

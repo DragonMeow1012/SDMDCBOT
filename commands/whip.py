@@ -1,12 +1,13 @@
 """
 電子皮鞭指令：/電子皮鞭、/調教排行、/清除調教
 """
-import json
 import os
 import discord
 from discord import app_commands
 
 from config import MASTER_ID
+from utils.json_store import load_json, save_json
+from utils.discord_helpers import owner_only_button_check, format_leaderboard
 
 
 _WHIP_FILE = os.path.join('data', 'whip_records.json')
@@ -14,32 +15,8 @@ _WHIP_REL_FILE = os.path.join('data', 'whip_relations.json')
 _WHIP_IMG  = os.path.join('picture', 'whip.png')
 
 
-# ── 次數紀錄 ─────────────────────────────────────────────────────────────────
-
-def _load_whip() -> dict:
-    if os.path.exists(_WHIP_FILE):
-        with open(_WHIP_FILE, encoding='utf-8') as f:
-            return json.load(f)
-    return {}
-
-
-def _save_whip(data: dict) -> None:
-    with open(_WHIP_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-# ── 調教關係 {gid: {trainee_id: trainer_id}} ─────────────────────────────────
-
 def load_relations() -> dict:
-    if os.path.exists(_WHIP_REL_FILE):
-        with open(_WHIP_REL_FILE, encoding='utf-8') as f:
-            return json.load(f)
-    return {}
-
-
-def _save_relations(data: dict) -> None:
-    with open(_WHIP_REL_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    return load_json(_WHIP_REL_FILE)
 
 
 def is_trainer_of(guild_id: int, trainer_id: int, trainee_id: int) -> bool:
@@ -55,14 +32,14 @@ async def _do_whip(send_fn, trainer: discord.Member, trainee: discord.Member, gu
     uid = str(trainee.id)
 
     # 次數 +1
-    records = _load_whip()
+    records = load_json(_WHIP_FILE)
     records.setdefault(gid, {})[uid] = records.get(gid, {}).get(uid, 0) + 1
-    _save_whip(records)
+    save_json(_WHIP_FILE, records)
 
     # 建立關係
     rels = load_relations()
     rels.setdefault(gid, {})[uid] = str(trainer.id)
-    _save_relations(rels)
+    save_json(_WHIP_REL_FILE, rels)
 
     text = (f'{trainee.mention} 被 {trainer.mention} 用皮鞭狠狠調教了，'
             f'現在是隻乖狗狗了❤️')
@@ -83,8 +60,7 @@ class WhipConfirmView(discord.ui.View):
 
     @discord.ui.button(label='願意', style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, _btn: discord.ui.Button):
-        if interaction.user.id != self.trainee.id:
-            await interaction.response.send_message('這不是你的確認按鈕喵！', ephemeral=True)
+        if not await owner_only_button_check(interaction, self.trainee.id):
             return
         await interaction.response.edit_message(content='調教中...', view=None)
         await _do_whip(interaction.followup.send, self.trainer, self.trainee, self.guild_id)
@@ -92,8 +68,7 @@ class WhipConfirmView(discord.ui.View):
 
     @discord.ui.button(label='拒絕', style=discord.ButtonStyle.secondary)
     async def deny(self, interaction: discord.Interaction, _btn: discord.ui.Button):
-        if interaction.user.id != self.trainee.id:
-            await interaction.response.send_message('這不是你的確認按鈕喵！', ephemeral=True)
+        if not await owner_only_button_check(interaction, self.trainee.id):
             return
         await interaction.response.edit_message(
             content=f'{self.trainee.mention} 拒絕了調教！', view=None)
@@ -149,26 +124,15 @@ def setup(tree: app_commands.CommandTree) -> None:
             await interaction.response.send_message('此指令只能在伺服器中使用！', ephemeral=True)
             return
 
-        records = _load_whip()
+        records = load_json(_WHIP_FILE)
         gid = str(guild.id)
         if gid not in records or not records[gid]:
             await interaction.response.send_message('還沒有人被調教過喵！', ephemeral=True)
             return
 
-        top10 = sorted(records[gid].items(), key=lambda x: x[1], reverse=True)[:10]
-
         await interaction.response.defer()
-        lines = ['**調教排行榜**']
-        for rank, (uid, cnt) in enumerate(top10, 1):
-            member = guild.get_member(int(uid))
-            if not member:
-                try:
-                    member = await guild.fetch_member(int(uid))
-                except discord.NotFound:
-                    pass
-            name = member.display_name if member else f'（已離開：{uid}）'
-            lines.append(f'`{rank}.` {name} — **{cnt}** 次')
-        await interaction.followup.send('\n'.join(lines))
+        text = await format_leaderboard(records[gid], guild, '**調教排行榜**')
+        await interaction.followup.send(text)
 
     @tree.command(name="清除調教", description="解除指定成員的調教關係（管理員/主人限定）")
     @app_commands.describe(被調教者="要解除調教關係的成員")
@@ -192,6 +156,6 @@ def setup(tree: app_commands.CommandTree) -> None:
                 f'{被調教者.mention} 目前沒有調教關係喵！', ephemeral=True)
             return
 
-        _save_relations(rels)
+        save_json(_WHIP_REL_FILE, rels)
         await interaction.response.send_message(
             f'✅ 已解除 {被調教者.mention} 的調教關係。', ephemeral=True)

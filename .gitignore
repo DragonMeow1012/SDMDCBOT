@@ -1,7 +1,45 @@
+# ── 機密設定 ─────────────────────────────
 .env
-data/chat_history.json
-data/bot.log
+.env.*
+!.env.example
+
+# ── Python 編譯 / 快取 ─────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.pycachetmp/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── 虛擬環境 ────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── 編輯器 / IDE ─────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ── 日誌 ─────────────────────────────
+bot.log
+*.log
+*.log.*
+data/bot.log
+
+# ── 文件產物 ─────────────────────────
+*.pdf
+
+# ── 本地資料（聊天歷史、暱稱、知識庫、炮決記錄等皆不上傳）──
+# 目錄整體忽略，但保留目錄本身 + picture 固定素材
 data/*
-pixivdata/*
+!data/picture/
+!data/.gitkeep
+data/picture/*.tmp
+
+# ── Pixiv 爬蟲資料（圖片 + SQLite + FAISS，體積大且為本地快取）──
+pixivdata/

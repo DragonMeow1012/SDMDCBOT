@@ -9,21 +9,10 @@ import discord
 from discord import app_commands
 
 from config import MASTER_ID
+from utils.json_store import load_json, save_json
 
 
 _MERIT_FILE = os.path.join('data', 'merit.json')
-
-
-def _load_merit() -> dict:
-    if os.path.exists(_MERIT_FILE):
-        with open(_MERIT_FILE, encoding='utf-8') as f:
-            return json.load(f)
-    return {}
-
-
-def _save_merit(data: dict) -> None:
-    with open(_MERIT_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 class MeritView(discord.ui.View):
@@ -34,9 +23,9 @@ class MeritView(discord.ui.View):
     @discord.ui.button(label='功德+1', style=discord.ButtonStyle.success, custom_id='merit_btn')
     async def merit_btn(self, interaction: discord.Interaction, _btn: discord.ui.Button):
         uid = str(interaction.user.id)
-        data = _load_merit()
+        data = load_json(_MERIT_FILE)
         data[uid] = data.get(uid, 0) + 1
-        _save_merit(data)
+        save_json(_MERIT_FILE, data)
         self.session_count += 1
         nick = interaction.user.display_name
         await interaction.response.edit_message(
@@ -263,7 +252,7 @@ def setup(tree: app_commands.CommandTree) -> None:
 
     @tree.command(name="電子木魚功德排行榜", description="查看本伺服器敲木魚功德累積次數 TOP10 排行榜")
     async def slash_merit_rank(interaction: discord.Interaction):
-        data = _load_merit()
+        data = load_json(_MERIT_FILE)
         if not data:
             await interaction.response.send_message('還沒有人積過功德喵！', ephemeral=True)
             return
@@ -281,12 +270,11 @@ def setup(tree: app_commands.CommandTree) -> None:
         if interaction.user.id != MASTER_ID:
             await interaction.response.send_message('此指令限主人使用喵！', ephemeral=True)
             return
-        data = _load_merit()
+        data = load_json(_MERIT_FILE)
         if not data:
             await interaction.response.send_message('功德排行榜本來就是空的喵！', ephemeral=True)
             return
-        with open(_MERIT_FILE, 'w', encoding='utf-8') as f:
-            json.dump({}, f)
+        save_json(_MERIT_FILE, {})
         await interaction.response.send_message('✅ 功德排行榜已清除！', ephemeral=True)
 
     @tree.command(name="賽博體重計", description="量測你的賽博體重，體重過重有機率觸發特殊反應")

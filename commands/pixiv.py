@@ -265,7 +265,7 @@ def _run_full(stop_event: threading.Event):
     try:
         while not stop_event.is_set():
             _write_status_json(running_override=True)
-            logger.info('???? Pixiv ????')
+            logger.info('啟動 Pixiv 全站爬取')
             try:
                 crawler.run_full_crawl(stop_event)
             except Exception as e:

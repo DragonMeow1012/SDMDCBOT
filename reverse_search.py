@@ -7,9 +7,9 @@
 """
 import asyncio
 import io
-import os
-import tempfile
+
 import requests
+
 from config import SAUCENAO_API_KEY
 
 
@@ -148,13 +148,8 @@ async def _soutubot_search(image_data: bytes, mime_type: str) -> list[dict]:
         return []
 
     ext = '.jpg' if 'jpeg' in mime_type else ('.gif' if 'gif' in mime_type else '.png')
-    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+    captured: list[dict] = []
     try:
-        tmp.write(image_data)
-        tmp.close()
-
-        captured: list[dict] = []
-
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(
                 headless=True,
@@ -239,8 +234,6 @@ async def _soutubot_search(image_data: bytes, mime_type: str) -> list[dict]:
     except Exception as e:
         print(f'[SOUTU] 搜尋失敗: {e}')
         return []
-    finally:
-        os.unlink(tmp.name)
 
 
 # ── 本地 Pixiv FAISS 搜尋 ─────────────────────────────────────────────────────

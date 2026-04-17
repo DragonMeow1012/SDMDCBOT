@@ -1,47 +1,51 @@
 """
-網頁抓取模組。
+網頁抓取模組：用 aiohttp 做真正的非同步抓取 + BeautifulSoup 解析。
 """
-import re
 import asyncio
-import requests
+import re
+
+import aiohttp
 from bs4 import BeautifulSoup
 
 _MAX_CONTENT_LENGTH = 2000
+_HEADERS = {"User-Agent": "Mozilla/5.0"}
+_TIMEOUT = aiohttp.ClientTimeout(total=20, connect=5)
+
+_ELEMENTS = ('p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'a', 'span')
+
+
+def _parse(html: str) -> str:
+    soup = BeautifulSoup(html, 'html.parser')
+    for tag in soup(['script', 'style', 'noscript']):
+        tag.decompose()
+    text = '\n'.join(
+        e.get_text(separator=' ', strip=True)
+        for e in soup.find_all(_ELEMENTS)
+    )
+    return re.sub(r'\s+', ' ', text).strip()[:_MAX_CONTENT_LENGTH]
 
 
 async def fetch_url(url: str) -> str:
-    """
-    非同步抓取並解析網頁文字內容。
-    成功回傳清理後的文字（最多 2000 字）；
-    失敗回傳以「錯誤:」開頭的說明字串。
-    """
+    """抓並解析網頁；成功回清理後文字，失敗回「錯誤: ...」。"""
     if 'nhentai.net' in url:
         return '錯誤: 不支援抓取此網站'
 
     try:
-        resp = await asyncio.to_thread(
-            requests.get, url, timeout=(5, 15),
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        resp.raise_for_status()
+        async with aiohttp.ClientSession(timeout=_TIMEOUT, headers=_HEADERS) as session:
+            async with session.get(url) as resp:
+                resp.raise_for_status()
+                html = await resp.text()
 
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        for tag in soup(['script', 'style', 'noscript']):
-            tag.decompose()
+        # HTML 解析交給 thread pool，避免阻塞 event loop
+        return await asyncio.to_thread(_parse, html)
 
-        elems = soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'a', 'span'])
-        text = '\n'.join(e.get_text(separator=' ', strip=True) for e in elems)
-        cleaned = re.sub(r'\s+', ' ', text).strip()
-
-        return cleaned[:_MAX_CONTENT_LENGTH]
-
-    except requests.exceptions.Timeout:
+    except asyncio.TimeoutError:
         print(f"❌ 請求逾時: {url}")
         return "錯誤: 請求逾時，網頁無回應"
-    except requests.exceptions.HTTPError as e:
-        print(f"❌ HTTP 錯誤 {e.response.status_code}: {url}")
-        return f"錯誤: HTTP {e.response.status_code}"
-    except requests.exceptions.RequestException as e:
+    except aiohttp.ClientResponseError as e:
+        print(f"❌ HTTP 錯誤 {e.status}: {url}")
+        return f"錯誤: HTTP {e.status}"
+    except aiohttp.ClientError as e:
         print(f"❌ 抓取失敗 {url}: {e}")
         return f"錯誤: 無法訪問該網頁 ({e})"
     except Exception as e:

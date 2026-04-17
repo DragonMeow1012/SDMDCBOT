@@ -71,11 +71,12 @@ NEW_ILLUSTS_MAX_PAGES: int = 15
 
 # ===== 圖片下載設定 =====
 MAX_IMAGE_SIZE = (1024, 1024)
-DOWNLOAD_WORKERS = 6           # 並行下載數（多核 I/O）
+DOWNLOAD_WORKERS = 8           # 並行下載數（I/O bound，8 個 worker 對 50 Mbps 頻寬是甜蜜點）
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_CHUNK_SIZE = 64 * 1024
-DOWNLOAD_RATE_LIMIT_Mbps = 120
-MAX_DOWNLOAD_RATE_LIMIT_Mbps = 120
+# 下載頻寬上限：50 Mbps ≈ 6.25 MB/s（保留頻寬給其他功能）
+DOWNLOAD_RATE_LIMIT_Mbps = 50
+MAX_DOWNLOAD_RATE_LIMIT_Mbps = 50
 
 # illust_detail API 最大並發數（用於漫畫多頁 URL 補抓）
 API_DETAIL_CONCURRENCY: int = 3

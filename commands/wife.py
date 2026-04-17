@@ -4,29 +4,19 @@
 """
 import asyncio
 import io
-import json
 import os
 from datetime import datetime, timezone, timedelta
 import random
 import discord
 from discord import app_commands
 
+from utils.json_store import load_json, save_json
+from utils.discord_helpers import get_member_safe
+
 
 _WIFE_FILE  = os.path.join('data', 'wife_records.json')
 _LOVE_EMOJI = '<:klllove:1486300373068152832>'
 _DAY_KEY_FMT = "%Y-%m-%d"
-
-
-def _load_wife() -> dict:
-    if os.path.exists(_WIFE_FILE):
-        with open(_WIFE_FILE, encoding='utf-8') as f:
-            return json.load(f)
-    return {}
-
-
-def _save_wife(data: dict) -> None:
-    with open(_WIFE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def _today_key() -> str:
@@ -61,7 +51,7 @@ def get_active_wife_rels(guild_id: int) -> dict[str, str]:
     """
     回傳目前有效的媽媽關係 {child_id: mom_id}，供關係圖使用。
     """
-    data   = _purge_expired(_load_wife())
+    data   = _purge_expired(load_json(_WIFE_FILE))
     gid    = str(guild_id)
     result = {}
     for uid, rec in data.get(gid, {}).items():
@@ -104,7 +94,7 @@ def setup(tree: app_commands.CommandTree) -> None:
         # 儲存與讀取（當日有抽過就直接沿用）
         gid  = str(guild.id)
         uid  = str(interaction.user.id)
-        data = _purge_expired(_load_wife())
+        data = _purge_expired(load_json(_WIFE_FILE))
         rec  = data.get(gid, {}).get(uid)
 
         wife = None
@@ -112,12 +102,7 @@ def setup(tree: app_commands.CommandTree) -> None:
         if rec is not None and _record_day_key(rec) == _today_key():
             wife_id = rec.get('wife_id')
             if wife_id:
-                wife = guild.get_member(int(wife_id))
-                if wife is None:
-                    try:
-                        wife = await guild.fetch_member(int(wife_id))
-                    except discord.NotFound:
-                        wife = None
+                wife = await get_member_safe(guild, int(wife_id))
         else:
             wife    = random.choice(candidates)
             wife_id = str(wife.id)
@@ -125,24 +110,18 @@ def setup(tree: app_commands.CommandTree) -> None:
                 'date':    _today_key(),
                 'wife_id': wife_id,
             }
-            _save_wife(data)
+            save_json(_WIFE_FILE, data)
 
-        # 取得頭像
+        # 取得頭像（使用 discord.Asset.read() 走 aiohttp，不再阻塞 event loop）
         if wife is not None:
-            name       = wife.display_name
-            avatar_url = str(wife.display_avatar.replace(size=512).url)
-        else:
-            name       = f'<@{wife_id}>' if wife_id else '對方'
-            avatar_url = None
-
-        import requests as _req
-        if avatar_url:
+            name  = wife.display_name
+            asset = wife.display_avatar.replace(size=512)
             try:
-                resp         = await asyncio.to_thread(_req.get, avatar_url, timeout=8)
-                avatar_bytes = resp.content if resp.status_code == 200 else None
+                avatar_bytes = await asset.read()
             except Exception:
                 avatar_bytes = None
         else:
+            name = f'<@{wife_id}>' if wife_id else '對方'
             avatar_bytes = None
 
         text = f'你今天的媽媽是：**{name}**\n要好好對待她哦{_LOVE_EMOJI}'
@@ -180,12 +159,12 @@ def setup(tree: app_commands.CommandTree) -> None:
 
         gid  = str(guild.id)
         uid  = str(interaction.user.id)
-        data = _purge_expired(_load_wife())
+        data = _purge_expired(load_json(_WIFE_FILE))
         data.setdefault(gid, {})[uid] = {
             'date':    _today_key(),
             'wife_id': str(用戶.id),
         }
-        _save_wife(data)
+        save_json(_WIFE_FILE, data)
 
         text = f'{interaction.user.mention} 認了 {用戶.mention} 作為媽媽！{_LOVE_EMOJI}'
         await interaction.response.send_message(
@@ -198,7 +177,7 @@ def setup(tree: app_commands.CommandTree) -> None:
         gid    = str(interaction.guild_id)
         uid    = str(用戶.id)
         my_id  = str(interaction.user.id)
-        data   = _purge_expired(_load_wife())
+        data   = _purge_expired(load_json(_WIFE_FILE))
 
         rec = data.get(gid, {}).get(uid)
         if rec is None or rec.get('wife_id') != my_id:
@@ -209,7 +188,7 @@ def setup(tree: app_commands.CommandTree) -> None:
             return
 
         data[gid].pop(uid)
-        _save_wife(data)
+        save_json(_WIFE_FILE, data)
         text = f'{interaction.user.mention} 與 {用戶.mention} 斷絕了母子關係<:crycat:1486308949173997730>'
         await interaction.response.send_message(
             embed=discord.Embed(description=text, color=discord.Color.red())
@@ -219,7 +198,7 @@ def setup(tree: app_commands.CommandTree) -> None:
     async def slash_divorce(interaction: discord.Interaction):
         gid  = str(interaction.guild_id)
         uid  = str(interaction.user.id)
-        data = _purge_expired(_load_wife())
+        data = _purge_expired(load_json(_WIFE_FILE))
 
         if uid not in data.get(gid, {}):
             await interaction.response.send_message(
@@ -230,15 +209,10 @@ def setup(tree: app_commands.CommandTree) -> None:
 
         wife_id = data[gid][uid].get('wife_id')
         data[gid].pop(uid)
-        _save_wife(data)
+        save_json(_WIFE_FILE, data)
         wife_name = '對方'
         if wife_id and interaction.guild:
-            member = interaction.guild.get_member(int(wife_id))
-            if member is None:
-                try:
-                    member = await interaction.guild.fetch_member(int(wife_id))
-                except discord.NotFound:
-                    member = None
+            member = await get_member_safe(interaction.guild, int(wife_id))
             if member:
                 wife_name = member.display_name
         await interaction.response.send_message(
