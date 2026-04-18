@@ -1,13 +1,21 @@
-﻿"""
-Pixiv 鞈?摨急芋蝯?- SQLite ?脣???????孵噩??
-嚗??pixiv_x_Spider/database.py嚗蝙??pixiv_config嚗?
+"""
+Pixiv 資料庫模組 - SQLite 封裝，路徑由 pixiv_config 決定。
+
+Schema v3（2026-04-18 重整）：
+  - artworks        基本元資料
+  - features        page 0 pHash 備份
+  - GalleryPixiv    每頁 (image_url, color_hist 8B, nn_hash 64B)
+  - tags            正規化 tag 字典
+  - artwork_tags    作品 ↔ tag 關聯
+
+nn_hash = SSCD binary embedding（抗裁剪/修圖/翻譯）。
+init_db 會自動 ALTER 舊 DB 補 nn_hash 欄。
 """
 import sqlite3
-import json
 import threading
 import numpy as np
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 import pixiv_config as config
 
 _local = threading.local()
@@ -17,14 +25,22 @@ def get_connection() -> sqlite3.Connection:
     """取得 thread-local 的 SQLite 連線（避免每次呼叫都新建連線）。"""
     conn = getattr(_local, 'conn', None)
     if conn is None:
-        conn = sqlite3.connect(config.DB_PATH)
+        conn = sqlite3.connect(config.DB_PATH, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA foreign_keys=ON")
         _local.conn = conn
     return conn
 
 
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
 def init_db():
-    """?????澈銵冽"""
+    """建立/升級 schema。對舊 DB 會 ADD COLUMN 補齊，不會 drop 舊欄位。"""
     Path(config.DATA_DIR).mkdir(parents=True, exist_ok=True)
     with get_connection() as conn:
         conn.executescript("""
@@ -33,22 +49,20 @@ def init_db():
                 title         TEXT NOT NULL,
                 user_id       INTEGER,
                 user_name     TEXT,
-                tags          TEXT,       -- JSON array
                 bookmarks     INTEGER DEFAULT 0,
                 views         INTEGER DEFAULT 0,
                 width         INTEGER,
                 height        INTEGER,
                 page_count    INTEGER DEFAULT 1,
                 image_url     TEXT,
-                local_path    TEXT,
                 created_at    TEXT,
                 fetched_at    TEXT DEFAULT (datetime('now','localtime'))
             );
 
             CREATE TABLE IF NOT EXISTS features (
                 illust_id     INTEGER PRIMARY KEY REFERENCES artworks(illust_id),
-                color_hist    BLOB,   -- numpy float32 array (96 dims)
-                dominant_colors BLOB, -- JSON [[r,g,b], ...]
+                color_hist    BLOB,
+                dominant_colors BLOB,
                 updated_at    TEXT DEFAULT (datetime('now','localtime'))
             );
 
@@ -57,53 +71,83 @@ def init_db():
                 illust_id     INTEGER NOT NULL REFERENCES artworks(illust_id),
                 page_index    INTEGER NOT NULL,
                 image_url     TEXT,
-                local_path    TEXT,
-                color_hist    BLOB,   -- pHash bytes (8 bytes)
+                color_hist    BLOB,   -- pHash 8 bytes
+                nn_hash       BLOB,   -- SSCD binary hash 64 bytes (512-bit)
                 updated_at    TEXT DEFAULT (datetime('now','localtime')),
                 UNIQUE(illust_id, page_index)
             );
 
+            CREATE TABLE IF NOT EXISTS tags (
+                tag_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name   TEXT NOT NULL UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS artwork_tags (
+                illust_id INTEGER NOT NULL REFERENCES artworks(illust_id),
+                tag_id    INTEGER NOT NULL REFERENCES tags(tag_id),
+                PRIMARY KEY (illust_id, tag_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_artworks_bookmarks ON artworks(bookmarks DESC);
-            CREATE INDEX IF NOT EXISTS idx_artworks_user ON artworks(user_id);
-            CREATE INDEX IF NOT EXISTS idx_gallery_illust ON GalleryPixiv(illust_id);
+            CREATE INDEX IF NOT EXISTS idx_artworks_user      ON artworks(user_id);
+            CREATE INDEX IF NOT EXISTS idx_artwork_tags_tag   ON artwork_tags(tag_id);
         """)
 
+        # 舊 DB 補欄位（救生圈）
+        gallery_cols = _columns(conn, "GalleryPixiv")
+        if "nn_hash" not in gallery_cols:
+            conn.execute("ALTER TABLE GalleryPixiv ADD COLUMN nn_hash BLOB")
 
-def upsert_artwork(data: dict):
-    """?啣???唬????豢?"""
+
+def upsert_artwork(data: dict) -> None:
+    """寫入/更新作品元資料。tags 另外用 replace_artwork_tags() 寫。"""
     sql = """
         INSERT INTO artworks
-            (illust_id, title, user_id, user_name, tags, bookmarks, views,
-             width, height, page_count, image_url, local_path, created_at)
+            (illust_id, title, user_id, user_name, bookmarks, views,
+             width, height, page_count, image_url, created_at)
         VALUES
-            (:illust_id, :title, :user_id, :user_name, :tags, :bookmarks, :views,
-             :width, :height, :page_count, :image_url, :local_path, :created_at)
+            (:illust_id, :title, :user_id, :user_name, :bookmarks, :views,
+             :width, :height, :page_count, :image_url, :created_at)
         ON CONFLICT(illust_id) DO UPDATE SET
             bookmarks  = excluded.bookmarks,
             views      = excluded.views,
-            local_path = COALESCE(excluded.local_path, local_path),
             fetched_at = datetime('now','localtime')
     """
     with get_connection() as conn:
         conn.execute(sql, data)
 
 
-def upsert_features(illust_id: int, phash_vec: np.ndarray, dominant_colors: list = []):
-    """寫入 pHash 特徵（8 bytes uint8）。"""
+def replace_artwork_tags(illust_id: int, tag_names: Iterable[str]) -> None:
+    """將作品的 tag 關聯換成新的一組（先清再寫，冪等）。"""
+    names = [n for n in (tag_names or []) if isinstance(n, str) and n]
+    with get_connection() as conn:
+        conn.execute("DELETE FROM artwork_tags WHERE illust_id = ?", (illust_id,))
+        if not names:
+            return
+        # 先確保所有 tag 在 tags 表
+        conn.executemany("INSERT OR IGNORE INTO tags(name) VALUES (?)", [(n,) for n in names])
+        placeholders = ",".join("?" * len(names))
+        rows = conn.execute(
+            f"SELECT tag_id FROM tags WHERE name IN ({placeholders})", names
+        ).fetchall()
+        tag_ids = [r["tag_id"] for r in rows]
+        conn.executemany(
+            "INSERT OR IGNORE INTO artwork_tags(illust_id, tag_id) VALUES (?, ?)",
+            [(illust_id, tid) for tid in tag_ids],
+        )
+
+
+def upsert_features(illust_id: int, phash_vec: np.ndarray) -> None:
+    """寫入 page 0 pHash（8 bytes）備份。Wave 3 會連同 features 表一起廢除。"""
     sql = """
         INSERT INTO features (illust_id, color_hist, dominant_colors)
-        VALUES (?, ?, ?)
+        VALUES (?, ?, NULL)
         ON CONFLICT(illust_id) DO UPDATE SET
-            color_hist      = excluded.color_hist,
-            dominant_colors = excluded.dominant_colors,
-            updated_at      = datetime('now','localtime')
+            color_hist = excluded.color_hist,
+            updated_at = datetime('now','localtime')
     """
     with get_connection() as conn:
-        conn.execute(sql, (
-            illust_id,
-            phash_vec.astype(np.uint8).tobytes(),
-            json.dumps(dominant_colors)
-        ))
+        conn.execute(sql, (illust_id, phash_vec.astype(np.uint8).tobytes()))
 
 
 def upsert_gallery_page(
@@ -111,20 +155,21 @@ def upsert_gallery_page(
     page_index: int,
     image_url: str | None,
     phash_vec: np.ndarray | None,
-    local_path: str | None = None,
+    nn_hash: bytes | None = None,
 ) -> None:
+    """寫入一頁 (image_url, pHash 8B, nn_hash 64B)。任一為 None 皆不覆蓋舊值。"""
     sql = """
-        INSERT INTO GalleryPixiv (illust_id, page_index, image_url, local_path, color_hist)
+        INSERT INTO GalleryPixiv (illust_id, page_index, image_url, color_hist, nn_hash)
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(illust_id, page_index) DO UPDATE SET
             image_url   = excluded.image_url,
-            local_path  = excluded.local_path,
             color_hist  = COALESCE(excluded.color_hist, color_hist),
+            nn_hash     = COALESCE(excluded.nn_hash,    nn_hash),
             updated_at  = datetime('now','localtime')
     """
-    blob = None if phash_vec is None else phash_vec.astype(np.uint8).tobytes()
+    phash_blob = None if phash_vec is None else phash_vec.astype(np.uint8).tobytes()
     with get_connection() as conn:
-        conn.execute(sql, (illust_id, page_index, image_url, local_path, blob))
+        conn.execute(sql, (illust_id, page_index, image_url, phash_blob, nn_hash))
 
 
 def get_artwork(illust_id: int) -> Optional[sqlite3.Row]:
@@ -134,66 +179,41 @@ def get_artwork(illust_id: int) -> Optional[sqlite3.Row]:
         ).fetchone()
 
 
-def get_all_features() -> list[tuple[int, np.ndarray]]:
-    """????歇?? pHash ?孵噩????? [(illust_id, phash_uint8_array), ...]"""
-    with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT illust_id, color_hist FROM features WHERE color_hist IS NOT NULL"
-        ).fetchall()
-    result = []
-    for row in rows:
-        blob = row["color_hist"]
-        if len(blob) != 8:      # 頝喲??? float32 鞈?嚗?84 bytes嚗?
-            continue
-        arr = np.frombuffer(blob, dtype=np.uint8).copy()
-        result.append((row["illust_id"], arr))
-    return result
-
-
-def get_artworks_without_features() -> list[sqlite3.Row]:
-    """??撠???孵噩?歇銝?雿?"""
-    with get_connection() as conn:
-        return conn.execute("""
-            SELECT a.* FROM artworks a
-            LEFT JOIN features f ON a.illust_id = f.illust_id
-            WHERE a.local_path IS NOT NULL
-              AND f.illust_id IS NULL
-        """).fetchall()
-
-
 def search_by_ids(illust_ids: list[int]) -> list[sqlite3.Row]:
-    """靘?ID ?”?寞活?亥岷雿?"""
+    """依 ID 列表查詢作品。"""
     if not illust_ids:
         return []
     placeholders = ",".join("?" * len(illust_ids))
     with get_connection() as conn:
         return conn.execute(
             f"SELECT * FROM artworks WHERE illust_id IN ({placeholders})",
-            illust_ids
+            illust_ids,
         ).fetchall()
 
 
 def stats() -> dict:
-    """統計作品與索引進度（單次查詢取代 3 次獨立 COUNT）"""
+    """統計作品數、下載數、gallery 頁數、nn_hash 頁數。"""
     with get_connection() as conn:
         row = conn.execute("""
             SELECT
                 (SELECT COUNT(*) FROM artworks) AS total,
                 (SELECT COUNT(*) FROM features) AS downloaded,
-                (SELECT COUNT(*) FROM GalleryPixiv WHERE color_hist IS NOT NULL) AS gallery_pages
+                (SELECT COUNT(*) FROM GalleryPixiv WHERE color_hist IS NOT NULL) AS gallery_pages,
+                (SELECT COUNT(*) FROM GalleryPixiv WHERE nn_hash    IS NOT NULL) AS nn_pages
         """).fetchone()
     return {
         "total": row[0],
         "downloaded": row[1],
         "indexed": row[1],
         "gallery_pages": row[2],
+        "nn_pages": row[3],
     }
+
 
 def is_artwork_fully_indexed(illust_id: int, page_count: int) -> bool:
     with get_connection() as conn:
         has_feature = conn.execute(
-            "SELECT 1 FROM features WHERE illust_id = ?",
-            (illust_id,),
+            "SELECT 1 FROM features WHERE illust_id = ?", (illust_id,),
         ).fetchone() is not None
         if not has_feature:
             return False
@@ -260,11 +280,26 @@ def get_fully_indexed_artwork_ids(page_requirements: dict[int, int]) -> set[int]
     return fully_indexed
 
 
-def get_all_user_ids() -> set[int]:
-    """載入資料庫中所有已知的 user_id。"""
+def iter_user_id_chunks(chunk_size: int = 100_000):
+    """串流 DISTINCT user_id，用於 Bloom filter 批次初始化。"""
     with get_connection() as conn:
-        rows = conn.execute("SELECT DISTINCT user_id FROM artworks WHERE user_id IS NOT NULL").fetchall()
-    return {row["user_id"] for row in rows}
+        cur = conn.execute(
+            "SELECT DISTINCT user_id FROM artworks WHERE user_id IS NOT NULL"
+        )
+        while True:
+            rows = cur.fetchmany(chunk_size)
+            if not rows:
+                break
+            yield np.fromiter((r["user_id"] for r in rows), dtype=np.int64, count=len(rows))
+
+
+def user_exists(user_id: int) -> bool:
+    """用 idx_artworks_user 快速判斷 user_id 是否已在 artworks 表。"""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM artworks WHERE user_id = ? LIMIT 1", (user_id,)
+        ).fetchone()
+    return row is not None
 
 
 def get_all_fully_indexed_artwork_ids() -> set[int]:
@@ -289,4 +324,3 @@ def get_all_fully_indexed_artwork_ids() -> set[int]:
         if effective_pages <= 1 or row["gallery_count"] >= effective_pages:
             fully_indexed.add(row["illust_id"])
     return fully_indexed
-

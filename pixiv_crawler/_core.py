@@ -10,23 +10,22 @@ import io
 import json
 import logging
 import random
+import ssl
 import sys
 import threading
 import time
 from collections import deque
-from http.cookies import SimpleCookie
 from pathlib import Path
-from typing import Callable
-from urllib.parse import quote
+from typing import AsyncIterator, Callable
 
 import aiohttp
-import requests as std_requests
 from PIL import Image
 from pixivpy3 import AppPixivAPI
 
 import pixiv_config as config
 import pixiv_database as db
 import pixiv_feature as fe
+from utils.bloom import BloomFilter
 
 try:
     from curl_cffi import requests as curl_requests
@@ -55,6 +54,28 @@ if sys.platform == "win32":
         pass
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────
+# i.pximg.net 用 SSL context
+# OpenSSL 3.x 預設禁用 unsafe legacy renegotiation (CVE-2009-3555 保護)，
+# 但 Pixiv CDN 在資料傳輸途中會發起 TLS renegotiation (curl 看得到
+# "remote party requests renegotiation")，導致 aiohttp 連線被中斷，
+# 表現為 WinError 10053「本機系統已中止網路連線」。
+# 啟用 SSL_OP_LEGACY_SERVER_CONNECT 可恢復舊行為，curl 預設就是如此。
+# 僅用於 i.pximg.net 圖片下載，pixivpy 的 API 走 requests 不受影響。
+# ──────────────────────────────────────────────
+_PXIMG_SSL_CONTEXT: "ssl.SSLContext | None" = None
+
+
+def _get_pximg_ssl_context() -> ssl.SSLContext:
+    global _PXIMG_SSL_CONTEXT
+    if _PXIMG_SSL_CONTEXT is None:
+        ctx = ssl.create_default_context()
+        op_legacy = getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
+        ctx.options |= op_legacy
+        _PXIMG_SSL_CONTEXT = ctx
+    return _PXIMG_SSL_CONTEXT
 
 
 # ──────────────────────────────────────────────
@@ -138,8 +159,7 @@ _priority_user_ids: set[int] = set()
 _priority_lock = threading.Lock()
 _priority_user_done_hook: "Callable[[dict], None] | None" = None
 _page_log_lock = threading.Lock()
-_PAGE_LOG_MAX_LINES = 5000
-_tag_request_lock = asyncio.Lock()
+_PAGE_LOG_MAX_LINES = 500
 _tag_progress_lock = threading.Lock()
 _tag_progress: dict[str, dict] = {}   # key: "tag::sort", value: {page, done, chosen_query, chosen_sort, ts}
 
@@ -174,10 +194,11 @@ def _append_page_log(filename: str, payload: dict) -> None:
         log_path = page_log_dir / filename
         with log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        # 只在檔案大小超過閾值（約 5000 行 × 100 bytes）時才讀取整個檔案進行裁切，
-        # 避免每次寫入都分配 ~1MB 的記憶體。
+        # 超過閾值才讀整個檔案裁切，避免每次寫入都讀整檔。
+        # 閾值設成 _PAGE_LOG_MAX_LINES × 150 bytes（寬估單行長度），
+        # 超出時砍掉最舊的部分只留最新 _PAGE_LOG_MAX_LINES 行。
         try:
-            if log_path.stat().st_size > 500_000:
+            if log_path.stat().st_size > _PAGE_LOG_MAX_LINES * 150:
                 with log_path.open("r+", encoding="utf-8") as f:
                     lines = f.readlines()
                     if len(lines) > _PAGE_LOG_MAX_LINES:
@@ -232,8 +253,34 @@ def _log_timeout(event: str, target: str, timeout: float, *, page: int | None = 
 # Tag 爬取進度追蹤
 # ──────────────────────────────────────────────
 
-def _tag_key(tag: str, sort: str) -> str:
-    return f"{tag}::{sort}"
+def _tag_key(tag: str, sort: str, window: "str | None" = None) -> str:
+    base = f"{tag}::{sort}"
+    return f"{base}::w:{window}" if window else base
+
+
+def _date_windows() -> list[tuple["str | None", "str | None"]]:
+    """依 config 產生 (start_date, end_date) 日期窗口清單。
+    TAG_DATE_SLICE_DAYS=0 → 回傳單一 (None, None) 代表停用日期切片、維持舊行為。
+    窗口為 inclusive，格式 YYYY-MM-DD。逆序排列（最新的窗口先跑，更有機會撞到熱門作品）。
+    """
+    days = int(getattr(config, "TAG_DATE_SLICE_DAYS", 0) or 0)
+    if days <= 0:
+        return [(None, None)]
+    from datetime import date, timedelta
+    try:
+        start_str = str(getattr(config, "TAG_DATE_SLICE_START", "2007-09-10"))
+        anchor = date.fromisoformat(start_str)
+    except Exception:
+        anchor = date(2007, 9, 10)
+    today = date.today()
+    windows: list[tuple[str, str]] = []
+    cur = anchor
+    while cur <= today:
+        end = min(cur + timedelta(days=days - 1), today)
+        windows.append((cur.isoformat(), end.isoformat()))
+        cur = end + timedelta(days=1)
+    windows.reverse()
+    return [(s, e) for s, e in windows]
 
 
 def _load_tag_progress() -> None:
@@ -268,8 +315,8 @@ def _save_tag_progress() -> None:
         logger.warning(f"[進度] 儲存 tag 進度失敗: {e}")
 
 
-def _get_tag_progress(tag: str, sort: str) -> dict:
-    key = _tag_key(tag, sort)
+def _get_tag_progress(tag: str, sort: str, window: "str | None" = None) -> dict:
+    key = _tag_key(tag, sort, window)
     with _tag_progress_lock:
         return dict(_tag_progress.get(key, {}))
 
@@ -281,14 +328,16 @@ def _update_tag_progress(
     done: bool,
     chosen_query: "str | None" = None,
     chosen_sort: "str | None" = None,
+    window: "str | None" = None,
 ) -> None:
-    key = _tag_key(tag, sort)
+    key = _tag_key(tag, sort, window)
     with _tag_progress_lock:
         _tag_progress[key] = {
             "page": last_page,
             "done": done,
             "chosen_query": chosen_query,
             "chosen_sort": chosen_sort,
+            "window": window,
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
@@ -418,267 +467,61 @@ _PIXIV_HEADERS = {
 }
 
 
-def _build_tag_http_session(api: AppPixivAPI):
-    timeout = float(getattr(config, "PIXIV_API_TIMEOUT", 60.0))
-    session_kind = "requests"
-    session = std_requests.Session()
-
-    try:
-        existing_headers = dict(getattr(api.requests, "headers", {}))
-        if existing_headers:
-            session.headers.update(existing_headers)
-    except Exception:
-        pass
-    session.headers.update(_PIXIV_HEADERS)
-    session.headers.update({
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Origin": "https://www.pixiv.net",
-        "X-Requested-With": "XMLHttpRequest",
-    })
-
-    if config.PROXY:
-        session.proxies = {"http": config.PROXY, "https": config.PROXY}
-
-    raw_cookie = (getattr(config, "PIXIV_WEB_COOKIE", "") or "").strip()
-    if raw_cookie:
-        jar = SimpleCookie()
-        try:
-            jar.load(raw_cookie)
-        except Exception as e:
-            logger.warning(f"invalid PIXIV_WEB_COOKIE format: {e}")
-        else:
-            for key, morsel in jar.items():
-                try:
-                    session.cookies.set(key, morsel.value, domain=".pixiv.net")
-                except Exception:
-                    session.cookies.set(key, morsel.value)
-    return session, session_kind
-
-
-def _normalize_ajax_artwork(item: dict) -> dict | None:
-    if not item or item.get("isAdContainer"):
-        return None
-
-    illust_id_raw = item.get("illustId") or item.get("id")
-    if not illust_id_raw:
-        return None
-    try:
-        illust_id = int(illust_id_raw)
-    except Exception:
-        return None
-
-    illust_type = item.get("illustType", item.get("type"))
-    if illust_type is None:
-        illust_type = "0"
-    illust_type = str(illust_type)
-    # 0=illust, 1=manga, 2=ugoira (pixiv web/app commonly use these)
-    if illust_type not in ("0", "1", "2"):
-        illust_type = "0"
-
-    image_url = item.get("url") or ""
-    tags = item.get("tags") or []
-    if not isinstance(tags, list):
-        tags = []
-
-    return {
-        "illust_id": illust_id,
-        "title": item.get("illustTitle") or item.get("title") or "",
-        "user_id": int(item.get("userId") or item.get("user_id") or 0),
-        "user_name": item.get("userName") or item.get("user_name") or "",
-        "tags": json.dumps(tags, ensure_ascii=False),
-        "bookmarks": int(item.get("bookmarkCount") or 0),
-        "views": int(item.get("viewCount") or 0),
-        "width": int(item.get("width") or 0),
-        "height": int(item.get("height") or 0),
-        "page_count": int(item.get("pageCount") or 1),
-        "image_url": image_url,
-        "gallery_urls": [image_url] if image_url else [],
-        "local_path": None,
-        "created_at": item.get("createDate") or item.get("uploadDate") or "",
-    }
-
-
-def _extract_ajax_illusts(payload: dict, sort: str, current_page: int) -> tuple[list[dict], bool]:
-    body = payload.get("body") or {}
-    illust_manga = body.get("illustManga") or []
-    if isinstance(illust_manga, dict):
-        raw_items = illust_manga.get("data") or illust_manga.get("items") or []
-        # Pixiv web payload variants seen in the wild:
-        # - nextUrl (string)
-        # - isLastPage (bool)
-        # - page/pageCount (ints)
-        # - total (int) with fixed page size (often 60)
-        if illust_manga.get("isLastPage") is True:
-            has_next = False
-        elif illust_manga.get("isLastPage") is False:
-            has_next = True
-        elif illust_manga.get("nextUrl"):
-            has_next = True
-        elif illust_manga.get("next"):
-            has_next = True
-        elif illust_manga.get("page") and illust_manga.get("pageCount"):
-            try:
-                has_next = int(illust_manga["page"]) < int(illust_manga["pageCount"])
-            except Exception:
-                has_next = False
-        elif illust_manga.get("total"):
-            try:
-                total = int(illust_manga["total"])
-                per_page = (
-                    illust_manga.get("perPage")
-                    or illust_manga.get("per_page")
-                    or len(raw_items)
-                    or int(getattr(config, "PIXIV_TAG_PAGE_SIZE", 60))
-                )
-                has_next = (current_page * int(per_page)) < total
-            except Exception:
-                has_next = False
-        else:
-            has_next = False
-    else:
-        raw_items = illust_manga
-        has_next = False
-
-    items: list[dict] = []
-    seen_ids: set[int] = set()
-
-    if sort == "popular_desc":
-        popular = body.get("popular") or {}
-        for bucket in ("permanent", "recent"):
-            for raw in popular.get(bucket) or []:
-                parsed = _normalize_ajax_artwork(raw)
-                if not parsed:
-                    continue
-                iid = parsed["illust_id"]
-                if iid in seen_ids:
-                    continue
-                seen_ids.add(iid)
-                items.append(parsed)
-
-    for raw in raw_items or []:
-        parsed = _normalize_ajax_artwork(raw)
-        if not parsed:
-            continue
-        iid = parsed["illust_id"]
-        if iid in seen_ids:
-            continue
-        seen_ids.add(iid)
-        items.append(parsed)
-
-    return items, has_next
-
-
-def _fetch_tag_ajax(tag_session, query: str, page: int, sort: str) -> dict:
-    encoded_query = quote(query, safe="")
-    url = f"https://www.pixiv.net/ajax/search/artworks/{encoded_query}"
-    params = {
-        "word": query,
-        "p": page,
-        "order": {
-            "date_desc": "date_d",
-            "date_asc": "date",
-        }.get(sort, "date_d"),
-        "mode": "all",
-        "s_mode": "s_tag",
-        "type": "all",
-        "lang": "zh",
-    }
-    timeout = float(getattr(config, "PIXIV_API_TIMEOUT", 60.0))
-    response = tag_session.get(url, params=params, timeout=timeout)
-    response.raise_for_status()
-    payload = response.json()
-    if payload.get("error"):
-        raise RuntimeError(payload.get("message") or "pixiv ajax search failed")
-    return payload
-
-
-def _build_tag_aiohttp_session(api: AppPixivAPI) -> tuple[aiohttp.ClientSession, str]:
-    """建立 aiohttp 版 tag 搜尋 session（非同步，取代 requests.Session）。"""
-    session_kind = "aiohttp"
-    headers = {}
-
-    try:
-        existing_headers = dict(getattr(api.requests, "headers", {}))
-        if existing_headers:
-            headers.update(existing_headers)
-    except Exception:
-        pass
-    headers.update(_PIXIV_HEADERS)
-    headers.update({
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Origin": "https://www.pixiv.net",
-        "X-Requested-With": "XMLHttpRequest",
-    })
-
-    cookies = {}
-    raw_cookie = (getattr(config, "PIXIV_WEB_COOKIE", "") or "").strip()
-    if raw_cookie:
-        jar = SimpleCookie()
-        try:
-            jar.load(raw_cookie)
-        except Exception as e:
-            logger.warning(f"invalid PIXIV_WEB_COOKIE format: {e}")
-        else:
-            for key, morsel in jar.items():
-                cookies[key] = morsel.value
-
-    timeout = aiohttp.ClientTimeout(total=float(getattr(config, "PIXIV_API_TIMEOUT", 60.0)))
-    connector_kwargs = {}
-    if config.PROXY:
-        # aiohttp 透過 connector 設定 proxy 或使用 request-level proxy
-        pass  # proxy 在 _fetch_tag_ajax_async 的 session.get() 指定
-
-    session = aiohttp.ClientSession(
-        headers=headers,
-        cookies=cookies,
-        timeout=timeout,
-        connector=aiohttp.TCPConnector(limit=5, ssl=False),
-    )
-    return session, session_kind
-
-
-async def _fetch_tag_ajax_async(
-    tag_session: aiohttp.ClientSession, query: str, page: int, sort: str
-) -> dict:
-    """非同步 AJAX tag 搜尋（取代同步版 _fetch_tag_ajax）。"""
-    encoded_query = quote(query, safe="")
-    url = f"https://www.pixiv.net/ajax/search/artworks/{encoded_query}"
-    params = {
-        "word": query,
-        "p": page,
-        "order": {
-            "date_desc": "date_d",
-            "date_asc": "date",
-        }.get(sort, "date_d"),
-        "mode": "all",
-        "s_mode": "s_tag",
-        "type": "all",
-        "lang": "zh",
-    }
-    proxy = config.PROXY if config.PROXY else None
-    async with tag_session.get(url, params=params, proxy=proxy) as response:
-        response.raise_for_status()
-        payload = await response.json()
-    if payload.get("error"):
-        raise RuntimeError(payload.get("message") or "pixiv ajax search failed")
-    return payload
-
-
 # ──────────────────────────────────────────────
 # API 初始化
 # ──────────────────────────────────────────────
 
-def _setup_api() -> AppPixivAPI:
+def _install_requests_default_timeout(api: AppPixivAPI) -> None:
+    """強制 api.requests 每次 HTTP 呼叫都帶 timeout，避免 TCP 半卡時永遠阻塞。
+    pixivpy3 底層是 cloudscraper/requests.Session，預設不帶 timeout；一旦連線半卡，
+    就會把 asyncio.to_thread 的 executor 執行緒無限期佔住（asyncio.wait_for 無法殺執行緒），
+    累積到執行緒池耗盡後整條爬取管線 deadlock。
+    """
+    if getattr(api.requests, "_dc_timeout_patched", False):
+        return
+    connect_t = float(getattr(config, "PIXIV_API_CONNECT_TIMEOUT", 10.0))
+    read_t = float(getattr(config, "PIXIV_API_READ_TIMEOUT", 30.0))
+    default_timeout = (connect_t, read_t)
+    orig_request = api.requests.request
+
+    def request_with_timeout(method, url, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = default_timeout
+        return orig_request(method, url, **kwargs)
+
+    api.requests.request = request_with_timeout
+    api.requests._dc_timeout_patched = True
+
+
+def _setup_api(token: "str | None" = None) -> AppPixivAPI:
     api = AppPixivAPI()
     if config.PROXY:
         api.set_additional_headers({"Proxy": config.PROXY})
         logger.info(f"使用代理: {config.PROXY}")
-    api.auth(refresh_token=config.PIXIV_REFRESH_TOKEN)
+    _install_requests_default_timeout(api)
+    refresh_token = token or config.PIXIV_REFRESH_TOKEN
+    api.auth(refresh_token=refresh_token)
     _api_last_auth[id(api)] = time.monotonic()  # 記錄 auth 時間，供 _maybe_reauth 使用
-    logger.info("Pixiv 驗證成功")
+    logger.info(f"Pixiv 驗證成功 (token ...{refresh_token[-6:]})")
     return api
+
+
+def _setup_api_pool() -> list[AppPixivAPI]:
+    """為 PIXIV_REFRESH_TOKENS 每一組 token 建立一個 AppPixivAPI。
+    缺 token 時只回傳主 api 一組，行為與原本單 token 路徑一致。"""
+    tokens = list(getattr(config, "PIXIV_REFRESH_TOKENS", None) or [])
+    if not tokens:
+        return [_setup_api()]
+    pool: list[AppPixivAPI] = []
+    for t in tokens:
+        try:
+            pool.append(_setup_api(t))
+        except Exception as e:
+            logger.warning(f"token ...{t[-6:]} 驗證失敗，跳過: {e}")
+    if not pool:
+        raise RuntimeError("所有 PIXIV_REFRESH_TOKENS 皆驗證失敗")
+    logger.info(f"[pool] 共 {len(pool)} 組 token 啟用並行爬取")
+    return pool
 
 
 def _get_dl_headers(api: AppPixivAPI) -> dict:
@@ -701,7 +544,7 @@ def _parse_illust(illust: dict) -> dict:
         "title":      illust["title"],
         "user_id":    illust["user"]["id"],
         "user_name":  illust["user"]["name"],
-        "tags":       json.dumps(tags, ensure_ascii=False),
+        "tag_names":  tags,   # 以 list 形式傳給 replace_artwork_tags；不再寫 JSON 進 artworks 表
         "bookmarks":  illust["total_bookmarks"],
         "views":      illust["total_view"],
         "width":      illust["width"],
@@ -709,27 +552,41 @@ def _parse_illust(illust: dict) -> dict:
         "page_count": illust["page_count"],
         "image_url":  image_url,
         "gallery_urls": gallery_urls,
-        "local_path": None,
         "created_at": illust["create_date"],
     }
 
 
 def _extract_gallery_urls(illust: dict) -> list[str]:
+    preferred = (getattr(config, "PREFERRED_IMAGE_SIZE", "large") or "large").lower()
+    if preferred not in ("original", "large"):
+        preferred = "large"
+
+    def _pick(image_urls: dict) -> "str | None":
+        if preferred == "large":
+            return image_urls.get("large") or image_urls.get("original")
+        return image_urls.get("original") or image_urls.get("large")
+
     urls: list[str] = []
     meta_pages = illust.get("meta_pages", []) or []
     for page in meta_pages:
         image_urls = page.get("image_urls", {}) or {}
-        url = image_urls.get("original") or image_urls.get("large")
+        url = _pick(image_urls)
         if url:
             urls.append(url)
 
     if not urls:
         single = (illust.get("meta_single_page", {}) or {}).get("original_image_url")
-        fallback = (illust.get("image_urls", {}) or {}).get("large")
-        if single:
-            urls.append(single)
-        elif fallback:
-            urls.append(fallback)
+        fallback_large = (illust.get("image_urls", {}) or {}).get("large")
+        if preferred == "large":
+            if fallback_large:
+                urls.append(fallback_large)
+            elif single:
+                urls.append(single)
+        else:
+            if single:
+                urls.append(single)
+            elif fallback_large:
+                urls.append(fallback_large)
     return urls
 
 
@@ -778,169 +635,141 @@ def _fetch_ranking(
     return artworks
 
 
-async def _fetch_tag(
+async def _fetch_tag_stream(
     api: AppPixivAPI,
     tag: str,
-    sort: str = "popular_desc",
-    start_page: int = 1,
-    max_pages: "int | None" = None,
-    resume_query: "str | None" = None,
-    resume_sort: "str | None" = None,
-    stop_event: "threading.Event | None" = None,
-) -> "tuple[list[dict], bool, int, str | None, str | None]":
+    sort: str,
+    start_page: int,
+    max_pages: "int | None",
+    resume_query: "str | None",
+    resume_sort: "str | None",
+    stop_event: "threading.Event | None",
+    state: dict,
+    flush_pages: int = 20,
+    start_date: "str | None" = None,
+    end_date: "str | None" = None,
+) -> AsyncIterator[list[dict]]:
+    """Stream tag 搜尋結果：每 `flush_pages` 頁 yield 一批作品，讓呼叫端能邊抓邊下載。
+    使用 App API `search_illust`（30 件/頁），繞過 web AJAX 的 Cloudflare 403。
+    迭代結束後 `state` 會填入：is_done / last_page / effective_query / effective_sort / total_artworks。
+    備註：`start_page` 為 App API 頁碼（offset = (page-1)*30）；舊 AJAX 檔是 60 件/頁，
+    切換後從同 page 值重入會多覆蓋，但 DB 去重，只多耗 API 不丟資料。
     """
-    抓取 tag 搜尋結果，支援斷點續抓與頁數限制（非同步版，不阻塞事件迴圈）。
+    state["is_done"] = False
+    state["last_page"] = max(0, start_page - 1)
+    state["effective_query"] = resume_query or tag
+    state["effective_sort"] = resume_sort or sort
+    state["total_artworks"] = 0
 
-    start_page:   起始頁碼（1-based），恢復上次中斷的進度
-    max_pages:    本次最多抓幾頁（None=不限）
-    resume_query/sort: 上次成功使用的 query/sort，跳過重新探測
-    stop_event:   若設定則在每頁之間檢查，設置時提前結束並儲存斷點
+    query = (resume_query or tag).strip()
+    effective_sort = resume_sort or sort
 
-    回傳 (artworks, is_done, last_success_page, effective_query, effective_sort)
-        is_done:           True=已無更多頁面，False=因 max_pages 或錯誤中止
-        last_success_page: 最後成功抓到的頁碼（0=未抓任何頁）
-    """
-    def _tag_candidates(raw_tag: str) -> list[str]:
-        cleaned = raw_tag.strip()
-        candidates = [cleaned]
-        no_hash = cleaned.lstrip("#＃").strip()
-        if no_hash and no_hash != cleaned:
-            candidates.append(no_hash)
-        return list(dict.fromkeys(candidates))
+    buffer: list[dict] = []
+    pages_in_buffer: int = 0
+    pages_fetched: int = 0
+    page: int = max(1, start_page)
+    is_done: bool = True
 
-    candidates = _tag_candidates(tag)
-    sort_candidates = [sort]
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            is_done = False
+            break
+        if max_pages is not None and pages_fetched >= max_pages:
+            is_done = False
+            break
 
-    async with _tag_request_lock:
+        offset = (page - 1) * 30
+        # 日期切片：若 caller 傳入 start_date/end_date，帶給 pixiv API 做範圍搜尋
+        search_kwargs: dict = {"word": query, "sort": effective_sort, "offset": offset}
+        if start_date:
+            search_kwargs["start_date"] = start_date
+        if end_date:
+            search_kwargs["end_date"] = end_date
+        window_label = f"{start_date}_{end_date}" if (start_date or end_date) else None
+        src_label = f"tag:{tag}:{sort}" + (f":{window_label}" if window_label else "")
+        window_extra = {"start_date": start_date, "end_date": end_date} if window_label else {}
         try:
-            tag_session, session_kind = _build_tag_aiohttp_session(api)
-        except Exception as e:
-            logger.warning(f"tag AJAX session init failed: {e}")
-            _log_page_fetch(
-                f"tag:{tag}:{sort}", start_page, offset=0, items=0,
-                next_url=False, status="ajax_init_error", extra={"error": str(e)},
+            result = await _to_thread_with_timeout(
+                api.search_illust,
+                **search_kwargs,
             )
-            return [], False, 0, None, None
+        except TimeoutError:
+            _log_page_fetch(
+                src_label, page, offset=offset,
+                items=0, next_url=False, status="timeout",
+                extra={"query": query, "effective_sort": effective_sort, "via": "app_api", **window_extra},
+            )
+            is_done = False
+            break
+        except Exception as e:
+            _log_page_fetch(
+                src_label, page, offset=offset,
+                items=0, next_url=False, status="api_error",
+                extra={"query": query, "effective_sort": effective_sort,
+                       "error": str(e), "via": "app_api", **window_extra},
+            )
+            is_done = False
+            break
 
-        try:
-            chosen_query: "str | None" = None
-            chosen_sort: "str | None" = None
-            artworks: list[dict] = []
-            pages_fetched: int = 0
-            has_next: bool = True
-            last_success_page: int = 0
-            page: int = 0
-
-            # ── 決定 chosen_query / chosen_sort + 初始頁碼 ────────────────
-            if start_page > 1 and resume_query and resume_sort:
-                # 快速路徑：有上次記錄，直接跳到 start_page
-                chosen_query = resume_query
-                chosen_sort = resume_sort
-                page = start_page - 1   # 迴圈第一次 += 1 後變成 start_page
-                has_next = True
-            else:
-                # 探測路徑：從第 1 頁確認有效的 (query, sort)
-                first_items: list[dict] = []
-                first_has_next = False
-                for try_sort in sort_candidates:
-                    for query in candidates:
-                        try:
-                            payload = await _fetch_tag_ajax_async(tag_session, query, 1, try_sort)
-                            items, hn = _extract_ajax_illusts(payload, try_sort, 1)
-                        except Exception as e:
-                            logger.warning(f"tag AJAX request failed query={query} sort={try_sort}: {e}")
-                            continue
-                        if items:
-                            chosen_query = query
-                            chosen_sort = try_sort
-                            first_items = items
-                            first_has_next = hn
-                            break
-                    if chosen_query is not None:
-                        break
-
-                if chosen_query is None or chosen_sort is None:
-                    _log_page_fetch(
-                        f"tag:{tag}:{sort}", 1, offset=0, items=0, next_url=False,
-                        status="empty",
-                        extra={"query_candidates": candidates, "sort_candidates": sort_candidates,
-                               "via": "ajax", "client": session_kind},
-                    )
-                    return [], True, 0, None, None
-
-                if start_page == 1:
-                    # 第 1 頁結果納入
-                    artworks = list(first_items)
-                    pages_fetched = 1
-                    last_success_page = 1
-                    has_next = first_has_next
-                    _log_page_fetch(
-                        f"tag:{tag}:{sort}", 1, offset=0, items=len(first_items),
-                        next_url=has_next,
-                        extra={"query": chosen_query, "effective_sort": chosen_sort,
-                               "via": "ajax", "client": session_kind},
-                    )
-                    if not has_next:
-                        return artworks, True, 1, chosen_query, chosen_sort
-                    page = 1
-                else:
-                    # start_page > 1 但無 resume 資訊：探測成功後跳至 start_page
-                    page = start_page - 1
-                    has_next = True
-
-            # ── 翻頁迴圈 ─────────────────────────────────────────────────
+        if not result or "illusts" not in result:
+            _log_page_fetch(
+                src_label, page, offset=offset,
+                items=0, next_url=False, status="empty",
+                extra={"query": query, "effective_sort": effective_sort, "via": "app_api", **window_extra},
+            )
             is_done = True
-            while has_next:
-                # stop_event 在每頁之間檢查，讓停止指令能在頁間生效
-                if stop_event is not None and stop_event.is_set():
-                    is_done = False
-                    break
-                if max_pages is not None and pages_fetched >= max_pages:
-                    is_done = False
-                    break
-                page += 1
-                await asyncio.sleep(config.FULL_CRAWL_API_DELAY)
-                try:
-                    payload = await _fetch_tag_ajax_async(tag_session, chosen_query, page, chosen_sort)
-                    page_items, has_next = _extract_ajax_illusts(payload, chosen_sort, page)
-                except Exception as e:
-                    _log_page_fetch(
-                        f"tag:{tag}:{sort}", page, offset=(page - 1) * 60,
-                        items=0, next_url=False, status="ajax_error",
-                        extra={"query": chosen_query, "effective_sort": chosen_sort,
-                               "error": str(e), "via": "ajax", "client": session_kind},
-                    )
-                    is_done = False  # 因錯誤中止，尚有更多
-                    break
-                if not page_items:
-                    _log_page_fetch(
-                        f"tag:{tag}:{sort}", page, offset=(page - 1) * 60,
-                        items=0, next_url=False, status="empty",
-                        extra={"query": chosen_query, "effective_sort": chosen_sort,
-                               "via": "ajax", "client": session_kind},
-                    )
-                    is_done = True  # 正常結束
-                    break
-                artworks.extend(page_items)
-                pages_fetched += 1
-                last_success_page = page
-                _log_page_fetch(
-                    f"tag:{tag}:{sort}", page, offset=(page - 1) * 60,
-                    items=len(page_items), next_url=has_next,
-                    extra={"query": chosen_query, "effective_sort": chosen_sort,
-                           "via": "ajax", "client": session_kind},
-                )
-                limit_str = f"/{max_pages}" if max_pages is not None else ""
-                logger.info(
-                    f"[tag] 「{tag}」{sort} "
-                    f"第 {page} 頁{limit_str}｜本頁 {len(page_items)} 件，累計 {len(artworks)} 件"
-                    + ("" if has_next else "  ← 最後一頁")
-                )
+            break
 
-            return artworks, is_done, last_success_page, chosen_query, chosen_sort
+        page_items = _iter_illusts(result)
+        # 套用 TAG_BOOKMARK_MAX 長尾過濾（避開 ranking 重疊）
+        cap = int(getattr(config, "TAG_BOOKMARK_MAX", 0) or 0)
+        if cap > 0:
+            page_items = [it for it in page_items if int(it.get("bookmarks") or 0) <= cap]
 
-        finally:
-            await tag_session.close()
+        has_next = bool(result.get("next_url"))
+
+        if not page_items and not has_next:
+            _log_page_fetch(
+                src_label, page, offset=offset,
+                items=0, next_url=False, status="empty",
+                extra={"query": query, "effective_sort": effective_sort, "via": "app_api", **window_extra},
+            )
+            is_done = True
+            break
+
+        buffer.extend(page_items)
+        pages_in_buffer += 1
+        pages_fetched += 1
+        state["last_page"] = page
+        state["total_artworks"] += len(page_items)
+        _log_page_fetch(
+            src_label, page, offset=offset,
+            items=len(page_items), next_url=has_next,
+            extra={"query": query, "effective_sort": effective_sort, "via": "app_api", **window_extra},
+        )
+        limit_str = f"/{max_pages}" if max_pages is not None else ""
+        logger.info(
+            f"[tag] 「{tag}」{sort} "
+            f"第 {page} 頁{limit_str}｜本頁 {len(page_items)} 件，累計 {state['total_artworks']} 件"
+            + ("" if has_next else "  ← 最後一頁")
+        )
+
+        if pages_in_buffer >= flush_pages and buffer:
+            batch = buffer
+            buffer = []
+            pages_in_buffer = 0
+            yield batch
+
+        if not has_next:
+            is_done = True
+            break
+
+        page += 1
+        await asyncio.sleep(config.FULL_CRAWL_API_DELAY)
+
+    state["is_done"] = is_done
+    if buffer:
+        yield buffer
 
 
 async def _fetch_related_async(api: AppPixivAPI, illust_id: int) -> list[dict]:
@@ -1175,6 +1004,13 @@ async def _fetch_user_artworks(
                 raise
             source = f"user_async:{user_id}:{fetch_type}"
             if not result or "illusts" not in result or not result["illusts"]:
+                if isinstance(result, dict) and "error" in result:
+                    logger.warning(
+                        f"user_illusts {user_id}:{fetch_type} p{page} 異常回應："
+                        f"{result.get('error')}"
+                    )
+                elif not result:
+                    logger.warning(f"user_illusts {user_id}:{fetch_type} p{page} 空回應")
                 _log_page_fetch(source, page, offset=offset, items=0, next_url=False, status="empty")
                 break
             page_items = _iter_illusts(result)
@@ -1225,14 +1061,16 @@ async def _download_artwork_async(
             return
 
         async with sem:
-            page_features: list[tuple[int, str, object]] = []
+            page_features: list[tuple[int, str, object, bytes]] = []
             urls_to_fetch = urls[:config.MAX_GALLERY_PAGES]
 
-            def _compute_phash(raw: bytes) -> object:
-                """CPU-bound pHash 提取，交由執行緒池處理以釋放 GIL。"""
+            def _compute_hashes(raw: bytes) -> tuple[object, bytes]:
+                """CPU-bound：同時算 pHash + NN binary hash，共享一次 decode/resize。"""
                 img = Image.open(io.BytesIO(raw)).convert("RGB")
                 img.thumbnail(config.MAX_IMAGE_SIZE, Image.LANCZOS)
-                return fe.extract_phash(img)
+                phash = fe.extract_phash(img)
+                nn_vec = fe.extract_nn_hash(img)
+                return phash, nn_vec.tobytes()
 
             for page_index, page_url in enumerate(urls_to_fetch):
                 page_success = False
@@ -1253,9 +1091,9 @@ async def _download_artwork_async(
                                 chunks.append(chunk)
                             data = b"".join(chunks)
 
-                        # 在執行緒池計算 pHash，讓 event loop 可同時處理其他 I/O
-                        phash_vec = await asyncio.to_thread(_compute_phash, data)
-                        page_features.append((page_index, page_url, phash_vec))
+                        # 在執行緒池同時算 pHash + NN hash，避免兩次 decode
+                        phash_vec, nn_blob = await asyncio.to_thread(_compute_hashes, data)
+                        page_features.append((page_index, page_url, phash_vec, nn_blob))
                         page_success = True
                         break
                     except Exception as e:
@@ -1278,15 +1116,20 @@ async def _download_artwork_async(
 
             def _persist() -> None:
                 db.upsert_artwork(artwork)
+                db.replace_artwork_tags(illust_id, artwork.get("tag_names") or [])
                 first_phash = None
-                for page_index, page_url, phash_vec in page_features:
+                import numpy as _np
+                for page_index, page_url, phash_vec, nn_blob in page_features:
                     db.upsert_gallery_page(
                         illust_id=illust_id,
                         page_index=page_index,
                         image_url=page_url,
                         phash_vec=phash_vec,
+                        nn_hash=nn_blob,
                     )
                     fe.add_to_index(illust_id, page_index, phash_vec)
+                    nn_vec = _np.frombuffer(nn_blob, dtype=_np.uint8)
+                    fe.add_nn_to_index(illust_id, page_index, nn_vec)
                     if first_phash is None:
                         first_phash = phash_vec
                 if first_phash is not None:
@@ -1406,17 +1249,21 @@ async def _process_batch_async(
 #User ID 掃描批次
 #──────────────────────────────────────────────
 async def _scan_user_batch_async(
-    scan_api: "AppPixivAPI", dl_headers: dict, visited_users: "set[int]", stop_event: "threading.Event",
+    scan_api: "AppPixivAPI", dl_headers: dict, stop_event: "threading.Event",
     batch_size: int, on_success: "Callable[[dict], None]", main_api: "AppPixivAPI | None" = None,
 ) -> int:
+    """跨多個 user_id 區段 round-robin 探測。
+    每次迭代選下一個「未到達上限」的 segment 推進一個 ID，避免 dead-zone 壟斷掃描預算。
+    """
     if not getattr(config, "USER_ID_SCAN_ENABLED", True): return 0
 
     delay = float(getattr(config, "USER_ID_SCAN_DELAY", 1.5))
-    cursor = _load_scan_cursor()
+    segments = _get_scan_segments()
+    cursors = _load_scan_cursors()  # 長度對齊 segments
 
-#[關鍵修改] 增加探測次數計數器
     scanned_count = 0
     users_done = 0
+    seg_rotor = 0   # round-robin 指標
 
     download_sem = asyncio.Semaphore(config.DOWNLOAD_WORKERS)
     api_detail_sem = asyncio.Semaphore(getattr(config, "API_DETAIL_CONCURRENCY", 3))
@@ -1424,44 +1271,69 @@ async def _scan_user_batch_async(
     counters = {"downloaded": 0, "skipped": 0, "failed": 0}
     _proc_api = main_api or scan_api
 
-    connector = aiohttp.TCPConnector(limit=config.DOWNLOAD_WORKERS * 3, enable_cleanup_closed=True, ttl_dns_cache=300)
+    def _pick_next_segment() -> int:
+        """回傳下一個未耗盡的 segment index；全耗盡時回傳 -1。"""
+        nonlocal seg_rotor
+        for _ in range(len(segments)):
+            idx = seg_rotor % len(segments)
+            seg_rotor += 1
+            _, end = segments[idx]
+            if end is None or cursors[idx] < end:
+                return idx
+        return -1
+
+    connector = aiohttp.TCPConnector(
+        limit=config.DOWNLOAD_WORKERS * 3,
+        enable_cleanup_closed=True,
+        ttl_dns_cache=300,
+        ssl=_get_pximg_ssl_context(),
+    )
     async with aiohttp.ClientSession(headers=dl_headers, connector=connector) as session:
 
-#[關鍵修改] 只要「探測次數」達到 batch_size 就無條件退出，不卡死迴圈
         while scanned_count < batch_size and not stop_event.is_set():
-            cursor += 1
-            scanned_count += 1  # 每次 ID 前進都算一次探測
-            _save_scan_cursor(cursor)
+            seg_idx = _pick_next_segment()
+            if seg_idx < 0:
+                logger.info("[user_scan] 所有 segment 皆已耗盡，結束本次批次")
+                break
 
-            if cursor in visited_users: continue
-            visited_users.add(cursor)
+            cursors[seg_idx] += 1
+            uid = cursors[seg_idx]
+            scanned_count += 1
+
+            # 每 10 次探測落一次 cursor 檔，降低 I/O
+            if scanned_count % 10 == 0:
+                _save_scan_cursors(cursors)
+
+            # 已在 DB 的 user_id 直接跳過（idx_artworks_user 索引查詢 ~μs）；
+            # 避免 Bloom false positive 永久遮蔽真實用戶，scan 用 exact check。
+            if await asyncio.to_thread(db.user_exists, uid): continue
 
             try:
-                result = await _to_thread_with_timeout(scan_api.user_detail, cursor)
+                result = await _to_thread_with_timeout(scan_api.user_detail, uid)
                 await asyncio.sleep(delay)
                 if not result or "user" not in result: continue
                 user_name = result["user"]["name"]
             except Exception as e:
-                logger.debug(f"[user_scan] user={cursor} 無效: {e}")
+                logger.debug(f"[user_scan] seg{seg_idx} user={uid} 無效: {e}")
                 await asyncio.sleep(delay)
                 continue
 
             try:
-                artworks = await _to_thread_with_timeout(_fetch_user_artworks_sync, scan_api, cursor, api_lock)
+                artworks = await _to_thread_with_timeout(_fetch_user_artworks_sync, scan_api, uid, api_lock)
             except Exception as e:
-                logger.warning(f"[user_scan] user={cursor} 作品抓取失敗: {e}")
+                logger.warning(f"[user_scan] seg{seg_idx} user={uid} 作品抓取失敗: {e}")
                 artworks = []
 
             if artworks:
-                logger.info(f"[user_scan] user={cursor} ({user_name}) → {len(artworks)} 件")
+                logger.info(f"[user_scan] seg{seg_idx} user={uid} ({user_name}) → {len(artworks)} 件")
                 await _process_batch_async(_proc_api, session, artworks, counters, stop_event, download_sem, on_success=on_success, api_sem=api_detail_sem)
 
             users_done += 1
 
-    _save_scan_cursor(cursor)
+    _save_scan_cursors(cursors)
 
-#讓 Log 更清楚顯示狀況
-    logger.info(f"[user_scan] 批次結束 | 探測了 {scanned_count} 個 ID，實際有效用戶 {users_done} 位，目前 cursor={cursor}")
+    cur_summary = ", ".join(f"seg{i}={c}" for i, c in enumerate(cursors))
+    logger.info(f"[user_scan] 批次結束 | 探測 {scanned_count} 個 ID，有效 {users_done} 位 | {cur_summary}")
     return users_done
 
 
@@ -1473,25 +1345,46 @@ async def _run_full_crawl_async(
     stop_event: threading.Event,
     api: AppPixivAPI,
     dl_headers: dict,
-    visited_users: "set[int] | None" = None,
+    visited_users: "BloomFilter | None" = None,
     scan_api: "AppPixivAPI | None" = None,
     scan_dl_headers: "dict | None" = None,
+    diffusion_pool: "list[AppPixivAPI] | None" = None,
 ) -> None:
+    diffusion_pool = list(diffusion_pool or [])
     counters = {"downloaded": 0, "skipped": 0, "failed": 0, "round": 0}
     download_sem = asyncio.Semaphore(config.DOWNLOAD_WORKERS)
     # illust_detail 專用 semaphore：限制並發 API 呼叫數，避免 rate limit
     api_detail_sem = asyncio.Semaphore(getattr(config, "API_DETAIL_CONCURRENCY", 3))
 
     # ── 擴散佇列 ──────────────────────────────────────
-    # visited_users：已排程爬全作品的 user_id（session 內去重）
+    # visited_users：已排程爬全作品的 user_id（session 內去重）。
+    # 破億筆規模下 set[int] 會吃 GB 級 RAM，改用 Bloom filter：
+    # 1% FP 下 1 億筆僅 ~120MB，false positive = 少擴散一個作者（可接受）。
     if visited_users is None:
-        visited_users = await asyncio.to_thread(db.get_all_user_ids)
-        logger.info(f"已從 DB 載入 {len(visited_users)} 位已知作者")
+        visited_users = BloomFilter(
+            expected_n=int(getattr(config, "VISITED_USERS_BLOOM_N", 100_000_000)),
+            fp_rate=float(getattr(config, "VISITED_USERS_BLOOM_FP", 0.01)),
+        )
+
+        def _populate_bloom() -> int:
+            total = 0
+            for chunk in db.iter_user_id_chunks(100_000):
+                visited_users.add_many(chunk)
+                total += int(chunk.size)
+            return total
+
+        loaded = await asyncio.to_thread(_populate_bloom)
+        logger.info(
+            f"已從 DB 載入 {loaded} 位作者進 Bloom filter "
+            f"({visited_users.bytes_used() / 1024 / 1024:.1f} MB)"
+        )
     # related_visited：已取過相關作品的 illust_id
     related_visited: set[int] = set()
-    # 擴散佇列（無界，producer 從這裡取）
-    user_diff_q: asyncio.Queue[int] = asyncio.Queue()
-    related_diff_q: asyncio.Queue[int] = asyncio.Queue()
+    # 擴散佇列（有界，滿了就 drop producer；被 drop 的 uid 下輪可能再被發現）
+    user_q_max = int(getattr(config, "DIFFUSION_USER_Q_MAXSIZE", 10_000))
+    related_q_max = int(getattr(config, "DIFFUSION_RELATED_Q_MAXSIZE", 20_000))
+    user_diff_q: asyncio.Queue[int] = asyncio.Queue(maxsize=user_q_max)
+    related_diff_q: asyncio.Queue[int] = asyncio.Queue(maxsize=related_q_max)
     skip_related_budget = {"count": 0}
 
     def _on_artwork_success(artwork: dict) -> None:
@@ -1499,18 +1392,27 @@ async def _run_full_crawl_async(
         uid = artwork.get("user_id")
         if uid and uid not in visited_users:
             visited_users.add(uid)
-            user_diff_q.put_nowait(uid)
+            try:
+                user_diff_q.put_nowait(uid)
+            except asyncio.QueueFull:
+                pass  # 佇列滿了放棄擴散；該作者可於下輪 tag/scan 被重新發現
         iid = artwork.get("illust_id")
         if iid and iid not in related_visited:
             related_visited.add(iid)
-            related_diff_q.put_nowait(iid)
+            try:
+                related_diff_q.put_nowait(iid)
+            except asyncio.QueueFull:
+                pass
 
     def _on_artwork_skip(artwork: dict) -> None:
         """已索引作品採折衷擴散：作者必擴，相關作品採機率+限額擴散。"""
         uid = artwork.get("user_id")
         if uid and uid not in visited_users:
             visited_users.add(uid)
-            user_diff_q.put_nowait(uid)
+            try:
+                user_diff_q.put_nowait(uid)
+            except asyncio.QueueFull:
+                pass
 
         if not getattr(config, "SKIP_RELATED_DIFFUSION_ENABLED", True):
             return
@@ -1527,8 +1429,11 @@ async def _run_full_crawl_async(
             return
 
         related_visited.add(iid)
-        related_diff_q.put_nowait(iid)
-        skip_related_budget["count"] += 1
+        try:
+            related_diff_q.put_nowait(iid)
+            skip_related_budget["count"] += 1
+        except asyncio.QueueFull:
+            pass
 
     # ── 非 tag 種子（全站最新 / 推薦）────────────────────────
     # 排行榜已移入 tag 輪詢的奇數輪次（tag→user_scan→tag→ranking→user_scan）
@@ -1560,6 +1465,7 @@ async def _run_full_crawl_async(
             limit=config.DOWNLOAD_WORKERS * 3,
             enable_cleanup_closed=True,
             ttl_dns_cache=300,
+            ssl=_get_pximg_ssl_context(),
         )
         dl_session = aiohttp.ClientSession(headers=dl_headers, connector=connector)
 
@@ -1655,55 +1561,79 @@ async def _run_full_crawl_async(
                         "status": status,
                     })
 
+        async def _do_user_diffusion(uid: int, worker_api: AppPixivAPI) -> None:
+            try:
+                aw = await _to_thread_with_timeout(_fetch_user_artworks_sync, worker_api, uid)
+                logger.info(f"[擴散-作者] user={uid} → {len(aw)} 件")
+            except Exception as e:
+                logger.warning(f"[擴散-作者] 失敗 user={uid}: {e}")
+                aw = []
+            await _process(aw)
+
+        async def _do_related_diffusion(iid: int, worker_api: AppPixivAPI) -> None:
+            try:
+                aw = await _fetch_related_async(worker_api, iid)
+            except Exception as e:
+                logger.warning(f"[擴散-相關] 失敗 illust={iid}: {e}")
+                aw = []
+            # 不下載 related 作品本身，把作者丟進 user_diff_q，擴散係數 ~30→900。
+            new_users = 0
+            for a in aw:
+                uid = a.get("user_id")
+                if not uid or uid in visited_users:
+                    continue
+                visited_users.add(uid)
+                try:
+                    user_diff_q.put_nowait(uid)
+                    new_users += 1
+                except asyncio.QueueFull:
+                    break
+            logger.info(f"[擴散-相關→作者] illust={iid} → {len(aw)} 件，新增 {new_users} 位作者")
+
         async def _drain_diffusion(
             user_budget: int | None = None,
             related_budget: int | None = None,
         ) -> tuple[int, int]:
             """每次 tick 最多消耗 user_budget 個作者 + related_budget 個相關，
-            預算耗盡立即返回主循環，絕不無限擴散。"""
-            # 預算為 None 時用保守預設值，避免意外無上限執行
+            有 diffusion_pool 時用多 token 並行處理；否則串列跑主 api。"""
             if user_budget is None:
                 user_budget = int(getattr(config, "DIFFUSION_USER_QUOTA_PER_TICK", 5))
             if related_budget is None:
                 related_budget = int(getattr(config, "DIFFUSION_RELATED_QUOTA_PER_TICK", 5))
 
-            user_done = 0
-            related_done = 0
+            if stop_event.is_set() or get_priority_queue_size() > 0:
+                return 0, 0
 
-            # 交替消耗：1 user → 1 related → 1 user → ...，預算耗盡即返回
-            while not stop_event.is_set():
-                if get_priority_queue_size() > 0:
+            # 先抽本 tick 要做的工作
+            user_jobs: list[int] = []
+            while len(user_jobs) < user_budget:
+                try:
+                    user_jobs.append(user_diff_q.get_nowait())
+                except asyncio.QueueEmpty:
                     break
-                did_something = False
+            related_jobs: list[int] = []
+            while len(related_jobs) < related_budget:
+                try:
+                    related_jobs.append(related_diff_q.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
 
-                if user_done < user_budget and not user_diff_q.empty():
-                    uid = user_diff_q.get_nowait()
-                    try:
-                        aw = await _to_thread_with_timeout(_fetch_user_artworks_sync, api, uid)
-                        logger.info(f"[擴散-作者] user={uid} → {len(aw)} 件")
-                    except Exception as e:
-                        logger.warning(f"[擴散-作者] 失敗 user={uid}: {e}")
-                        aw = []
-                    await _process(aw)
-                    user_done += 1
-                    did_something = True
+            if not user_jobs and not related_jobs:
+                return 0, 0
 
-                if related_done < related_budget and not related_diff_q.empty():
-                    iid = related_diff_q.get_nowait()
-                    try:
-                        aw = await _fetch_related_async(api, iid)
-                        logger.info(f"[擴散-相關] illust={iid} → {len(aw)} 件")
-                    except Exception as e:
-                        logger.warning(f"[擴散-相關] 失敗 illust={iid}: {e}")
-                        aw = []
-                    await _process(aw)
-                    related_done += 1
-                    did_something = True
-
-                if not did_something:
-                    break  # 兩個佇列都空了
-
-            return user_done, related_done
+            # 工作端 api pool：優先用 diffusion_pool，否則退化為主 api
+            workers = diffusion_pool if diffusion_pool else [api]
+            tasks: list[asyncio.Task] = []
+            for i, uid in enumerate(user_jobs):
+                tasks.append(asyncio.create_task(
+                    _do_user_diffusion(uid, workers[i % len(workers)])
+                ))
+            for j, iid in enumerate(related_jobs):
+                tasks.append(asyncio.create_task(
+                    _do_related_diffusion(iid, workers[(len(user_jobs) + j) % len(workers)])
+                ))
+            await asyncio.gather(*tasks, return_exceptions=True)
+            return len(user_jobs), len(related_jobs)
 
         async def _priority_watcher() -> None:
             """
@@ -1714,28 +1644,96 @@ async def _run_full_crawl_async(
                 await _drain_priority()
                 await asyncio.sleep(2)
 
+        # ── 持久並行 workers ────────────────────────────────────────
+        # 主 loop 跑 tag/ranking/seeds (api=pool[0])；
+        # 以下三個 task 各自用獨立 token 並行消化工作：
+        #   - user_scan_loop: scan_api (pool[1]) 持續順序掃描 user_id
+        #   - user_diff_worker: pool[2] 持續消耗 user_diff_q
+        #   - related_diff_worker: pool[3] 持續消耗 related_diff_q
+        async def _user_scan_loop() -> None:
+            if not scan_api:
+                return
+            while not stop_event.is_set():
+                try:
+                    await _scan_user_batch_async(
+                        scan_api,
+                        scan_dl_headers or {},
+                        stop_event,
+                        user_batch_size,
+                        on_success=_on_artwork_success,
+                        main_api=api,
+                    )
+                except Exception as e:
+                    logger.warning(f"[user_scan_loop] 批次失敗，2 秒後重試: {e}")
+                    await asyncio.sleep(2)
+                else:
+                    await asyncio.sleep(0)
+
+        async def _user_diff_worker(worker_api: AppPixivAPI) -> None:
+            while not stop_event.is_set():
+                try:
+                    uid = await asyncio.wait_for(user_diff_q.get(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    continue
+                await _do_user_diffusion(uid, worker_api)
+
+        async def _related_diff_worker(worker_api: AppPixivAPI) -> None:
+            while not stop_event.is_set():
+                try:
+                    iid = await asyncio.wait_for(related_diff_q.get(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    continue
+                await _do_related_diffusion(iid, worker_api)
+
         # 啟動優先監視器（整個 round 含 60s 等待期間都有效）
         _watcher_task = asyncio.create_task(_priority_watcher())
+
+        # 分配 diffusion_pool：偶數位給 user_diff，奇數位給 related_diff
+        _persistent_tasks: list[asyncio.Task] = []
+        if scan_api:
+            _persistent_tasks.append(asyncio.create_task(_user_scan_loop(), name="user_scan_loop"))
+        _user_diff_apis = [a for i, a in enumerate(diffusion_pool) if i % 2 == 0]
+        _related_diff_apis = [a for i, a in enumerate(diffusion_pool) if i % 2 == 1]
+        for i, worker_api in enumerate(_user_diff_apis):
+            _persistent_tasks.append(asyncio.create_task(
+                _user_diff_worker(worker_api), name=f"user_diff_{i}",
+            ))
+        for i, worker_api in enumerate(_related_diff_apis):
+            _persistent_tasks.append(asyncio.create_task(
+                _related_diff_worker(worker_api), name=f"related_diff_{i}",
+            ))
+        _has_persistent_diffusion = bool(_user_diff_apis or _related_diff_apis)
+        logger.info(
+            f"[parallel] 啟動 {len(_persistent_tasks)} 個持久 worker "
+            f"(user_scan={'on' if scan_api else 'off'}, "
+            f"user_diff={len(_user_diff_apis)}, related_diff={len(_related_diff_apis)})"
+        )
         try:
             await _drain_priority()
 
 # ── 建立本輪 tag 輪詢清單 (Carousel) ────────────────────────────────
             # 確保 sort 在外層，tag 在內層，達成先廣度掃描所有 tag 的「最新」
-            tags_sorts = [
-                (tag, sort)
+            # 日期切片：每個 (tag, sort) 展開成 N 個 (tag, sort, window) 項目，
+            # 突破 pixiv search_illust offset 5000 硬性上限（每窗口各自 5000 件）。
+            _date_wins = _date_windows()  # [(sd, ed), ...] 最新窗口在前
+            # window_key = "YYYY-MM-DD_YYYY-MM-DD" 或 "" (代表不切片)
+            tags_sorts: list[tuple[str, str, str, "str | None", "str | None"]] = [
+                (tag, sort, f"{sd}_{ed}" if sd else "", sd, ed)
                 for sort in getattr(config, "CRAWL_TAG_SORTS", ["date_desc", "date_asc"])
                 for tag in config.ALL_TAGS
+                for (sd, ed) in _date_wins
             ]
 
             # [關鍵修復] 根據全域紀錄旋轉清單，確保重啟後不會從頭開始
             last_tag_key = _get_last_processed_tag()
             if last_tag_key:
                 resume_idx = -1
-                for i, (t, s) in enumerate(tags_sorts):
-                    if _tag_key(t, s) == last_tag_key:
+                for i, entry in enumerate(tags_sorts):
+                    t, s, w = entry[0], entry[1], entry[2]
+                    if _tag_key(t, s, w or None) == last_tag_key:
                         resume_idx = i
                         break
-                
+
                 # 如果找到了上次的斷點，將清單切開並重新拼接
                 # 讓「上次跑的那個」排到最後面，它的「下一個」變成清單第 0 個
                 if resume_idx != -1:
@@ -1744,7 +1742,10 @@ async def _run_full_crawl_async(
 
             # ── 過濾與分組 ───────────────────────────────────────────────────
             # 1. 先過濾掉 done: True 的項目 (如你所說，44頁跑完的就跳過)
-            active_tags = [ts for ts in tags_sorts if not _get_tag_progress(ts[0], ts[1]).get("done", False)]
+            active_tags = [
+                ts for ts in tags_sorts
+                if not _get_tag_progress(ts[0], ts[1], ts[2] or None).get("done", False)
+            ]
 
             # 2. 若過濾後空了，代表全站掃完一輪，觸發重置
             if not active_tags:
@@ -1763,27 +1764,36 @@ async def _run_full_crawl_async(
 
             # ── tag → user_scan 交替主迴圈 ───────────────────────────────
             # 循環順序：tag(100頁) → user_scan → tag(100頁) → ranking → user_scan → 重複
-            for tag_idx, (tag, sort) in enumerate(tags_to_process):
+            for tag_idx, (tag, sort, win_key, start_date, end_date) in enumerate(tags_to_process):
                 if stop_event.is_set():
                     break
                 await _drain_priority()
+                win_opt: "str | None" = win_key or None
 
-                # 讀取此 tag/sort 的斷點進度（tags_to_process 已過濾 done=True，直接取斷點）
-                progress = _get_tag_progress(tag, sort)
+                # 讀取此 tag/sort/window 的斷點進度（已過濾 done=True，直接取斷點）
+                progress = _get_tag_progress(tag, sort, win_opt)
                 last_p = progress.get("page", 0)
                 start_page = last_p + 1 if last_p > 0 else 1
+                # 日期切片下每窗口上限 ~167 頁（offset 5000），不切片維持舊上限
+                if win_opt:
+                    win_cap = int(getattr(config, "TAG_DATE_SLICE_MAX_PAGES_PER_WINDOW", 167))
+                    window_max_pages = min(max_tag_pages, win_cap)
+                else:
+                    window_max_pages = max_tag_pages
                 resume_q = progress.get("chosen_query")
                 resume_s = progress.get("chosen_sort")
 
                 phase_label = "tag→user_scan" if tag_idx % 2 == 0 else "tag→ranking→user_scan"
                 total_tags = len(tags_to_process)
+                win_label = f" [{win_key}]" if win_key else ""
                 logger.info(
-                    f"[tag {tag_idx + 1}/{total_tags}] 開始: 「{tag}」{sort} "
-                    f"從第 {start_page} 頁（最多 {max_tag_pages} 頁）【{phase_label}】"
+                    f"[tag {tag_idx + 1}/{total_tags}] 開始: 「{tag}」{sort}{win_label} "
+                    f"從第 {start_page} 頁（最多 {window_max_pages} 頁）【{phase_label}】"
                 )
 
+                tag_state: dict = {}
                 try:
-                    # _fetch_tag 是多頁長跑任務，每頁 HTTP request 已有自己的 timeout；
+                    # tag 抓取是多頁長跑任務，每頁 HTTP request 已有自己的 timeout；
                     # 不套外層 asyncio timeout，改靠 stop_event 在頁間中斷。
                     # 同時啟動背景定時任務，每 5 秒觸發 progress hook 讓狀態保持更新。
                     async def _tag_status_pulse():
@@ -1793,34 +1803,56 @@ async def _run_full_crawl_async(
                                 _progress_hook(dict(counters))
                     _pulse_task = asyncio.create_task(_tag_status_pulse())
                     try:
-                        artworks, is_done, last_page, eff_q, eff_s = await _fetch_tag(
+                        flush_pages = int(getattr(config, "TAG_FETCH_FLUSH_PAGES", 20))
+                        # 邊抓邊下載：每 flush_pages 頁就把那一批丟進背景下載管線，
+                        # tag 還在翻頁時下載器已經在處理前面的批次。
+                        bg_label = f"tag:{tag}:{sort}" + (f":{win_key}" if win_key else "")
+                        async for batch in _fetch_tag_stream(
                             api, tag, sort,
-                            start_page, max_tag_pages, resume_q, resume_s, stop_event,
-                        )
+                            start_page, window_max_pages, resume_q, resume_s, stop_event,
+                            tag_state, flush_pages=flush_pages,
+                            start_date=start_date, end_date=end_date,
+                        ):
+                            await _process_bg(batch, label=bg_label)
+                            # 每批 flush 後即時保存進度，避免中斷丟位置
+                            _update_tag_progress(
+                                tag, sort,
+                                tag_state.get("last_page", 0),
+                                False,
+                                tag_state.get("effective_query"),
+                                tag_state.get("effective_sort"),
+                                window=win_opt,
+                            )
+                            _save_tag_progress()
                     finally:
                         _pulse_task.cancel()
                         await asyncio.gather(_pulse_task, return_exceptions=True)
-                    _update_tag_progress(tag, sort, last_page, is_done, eff_q, eff_s)
+
+                    is_done = bool(tag_state.get("is_done", False))
+                    last_page = int(tag_state.get("last_page", 0))
+                    eff_q = tag_state.get("effective_query")
+                    eff_s = tag_state.get("effective_sort")
+                    artworks_total = int(tag_state.get("total_artworks", 0))
+                    _update_tag_progress(tag, sort, last_page, is_done, eff_q, eff_s, window=win_opt)
                     _save_tag_progress()
                     tag_status = "done" if is_done else "paused"
                     logger.info(
-                        f"[tag {tag_idx + 1}/{total_tags}] 完成: 「{tag}」{sort} "
+                        f"[tag {tag_idx + 1}/{total_tags}] 完成: 「{tag}」{sort}{win_label} "
                         f"p{start_page}→{last_page} {'✓全部完成' if is_done else '⏸暫停(達上限)'} "
-                        f"→ {len(artworks)} 件"
+                        f"→ {artworks_total} 件"
                     )
                     _log_page_fetch(
                         f"phase:tag_done", 0,
                         status=tag_status,
-                        extra={"tag": tag, "sort": sort,
+                        extra={"tag": tag, "sort": sort, "window": win_key or None,
                                "pages_fetched": last_page - start_page + 1,
-                               "artworks": len(artworks),
+                               "artworks": artworks_total,
                                "next": "ranking" if tag_idx % 2 == 1 else "user_scan"},
                     )
                 except Exception as e:
-                    logger.warning(f"[tag {tag_idx + 1}/{total_tags}] 「{tag}」{sort} 失敗: {e}")
-                    artworks = []
+                    logger.warning(f"[tag {tag_idx + 1}/{total_tags}] 「{tag}」{sort}{win_label} 失敗: {e}")
                     _log_page_fetch("phase:tag_done", 0, status="error",
-                                    extra={"tag": tag, "sort": sort, "error": str(e)})
+                                    extra={"tag": tag, "sort": sort, "window": win_key or None, "error": str(e)})
 
                 # ── 循環順序：tag → [ranking] → user_scan → process ──────────
                 # user_scan 移至 process 之前，確保 page_log 立即出現切換記錄，
@@ -1903,51 +1935,15 @@ async def _run_full_crawl_async(
                         except Exception:
                             pass
 
-                # ── user_scan（在 process 之前執行，確保 log 立即可見）──────
-                if not scan_api and not stop_event.is_set():
-                    # scan_api 為 None 時嘗試重新初始化一次
-                    try:
-                        scan_api = await asyncio.to_thread(_setup_api)
-                        scan_dl_headers = _get_dl_headers(scan_api)
-                        logger.info("[user_scan] scan_api 重新初始化成功")
-                    except Exception as e:
-                        logger.warning(f"[user_scan] scan_api 初始化失敗，本輪跳過: {e}")
-                        _log_page_fetch("phase:user_scan_skip", 0, status="skip",
-                                        extra={"reason": str(e), "after": f"tag:{tag}:{sort}"})
-
-                if scan_api and not stop_event.is_set():
-                    cursor_before = _load_scan_cursor()
-                    logger.info(
-                        f"[user_scan] ── 開始 ID 順序掃描（{user_batch_size} 個 ID）"
-                        f"，cursor={cursor_before}"
-                        f"【tag {tag_idx + 1}/{total_tags}"
-                        f"{' + ranking' if tag_idx % 2 == 1 else ''} 之後】"
-                    )
-                    _log_page_fetch("phase:user_scan_start", 0, status="start",
-                                    extra={"cursor": cursor_before, "batch_size": user_batch_size,
-                                           "after": f"tag:{tag}:{sort}" + ("+ranking" if tag_idx % 2 == 1 else "")})
-                    await _scan_user_batch_async(
-                        scan_api,
-                        scan_dl_headers or {},
-                        visited_users,
-                        stop_event,
-                        user_batch_size,
-                        on_success=_on_artwork_success,
-                        main_api=api,
-                    )
-                    cursor_after = _load_scan_cursor()
-                    _log_page_fetch("phase:user_scan_done", 0, status="done",
-                                    extra={"cursor_start": cursor_before, "cursor_end": cursor_after})
-
-                # ── process：tag 本輪抓到的作品（ranking 已獨立 pipeline 下載）──
+                # user_scan 與 diffusion 交給持久 bg task 並行處理；
+                # 無 scan_api / 無 diffusion_pool 時退回原地串列跑，保後相容。
                 await _drain_priority()
-                await _process_bg(artworks, label=f"tag:{tag}:{sort}")
-                # diffusion 仍用小批次立即執行（資料量小，可接受）
-                await _drain_diffusion(
-                    user_budget=diffusion_user_quota,
-                    related_budget=diffusion_related_quota,
-                )
-                await _drain_priority()
+                if not _has_persistent_diffusion:
+                    await _drain_diffusion(
+                        user_budget=diffusion_user_quota,
+                        related_budget=diffusion_related_quota,
+                    )
+                    await _drain_priority()
 
             # ── 非 tag 種子（最新上傳 / 推薦）────────────────────
             logger.info("[種子] ── 開始非 tag 種子爬取（最新上傳 / 推薦）")
@@ -1970,21 +1966,25 @@ async def _run_full_crawl_async(
                     artworks = []
                 await _process_bg(artworks, label=label)
                 await _drain_priority()
-                await _drain_diffusion(
-                    user_budget=diffusion_user_quota,
-                    related_budget=diffusion_related_quota,
-                )
+                if not _has_persistent_diffusion:
+                    await _drain_diffusion(
+                        user_budget=diffusion_user_quota,
+                        related_budget=diffusion_related_quota,
+                    )
 
             # ── 尾端擴散（清空積壓的佇列）──────────────────────────────
-            await _drain_diffusion(
-                user_budget=diffusion_user_quota * diffusion_tail_multiplier,
-                related_budget=diffusion_related_quota * diffusion_tail_multiplier,
-            )
+            # 有持久 worker 時，queue 會被持續消化，這裡只需 drain priority。
+            if not _has_persistent_diffusion:
+                await _drain_diffusion(
+                    user_budget=diffusion_user_quota * diffusion_tail_multiplier,
+                    related_budget=diffusion_related_quota * diffusion_tail_multiplier,
+                )
             await _drain_priority()
-            await _drain_diffusion(
-                user_budget=diffusion_user_quota * diffusion_tail_multiplier,
-                related_budget=diffusion_related_quota * diffusion_tail_multiplier,
-            )
+            if not _has_persistent_diffusion:
+                await _drain_diffusion(
+                    user_budget=diffusion_user_quota * diffusion_tail_multiplier,
+                    related_budget=diffusion_related_quota * diffusion_tail_multiplier,
+                )
 
             # ── 等待所有背景下載完成後再統計、進入下一輪 ─────────────
             await _await_bg_tasks()
@@ -2008,6 +2008,10 @@ async def _run_full_crawl_async(
                 logger.info(f"[記憶體] 第 {current_round} 輪 FAISS tail 已合併")
             except Exception as e:
                 logger.warning(f"[記憶體] flush_index 失敗: {e}")
+            try:
+                await asyncio.to_thread(fe.flush_nn_index)
+            except Exception as e:
+                logger.warning(f"[記憶體] flush_nn_index 失敗: {e}")
             # 2. 建議 CPython GC 回收本輪產生的循環垃圾（Task closures / aiohttp 物件等）。
             gc.collect()
 
@@ -2019,12 +2023,18 @@ async def _run_full_crawl_async(
                     await asyncio.sleep(1)
         finally:
             _watcher_task.cancel()
-            await asyncio.gather(_watcher_task, return_exceptions=True)
+            for _t in _persistent_tasks:
+                _t.cancel()
+            await asyncio.gather(
+                _watcher_task, *_persistent_tasks,
+                return_exceptions=True,
+            )
             await _await_bg_tasks()   # stop 時也等背景完成
             await dl_session.close()
 
     logger.info("爬取結束，存檔 FAISS 索引...")
     fe.flush_index()
+    fe.flush_nn_index()
     s = db.stats()
     logger.info(f"爬取已停止，DB 共 {s['total']} 件，已索引 {s['indexed']} 件")
 
@@ -2035,29 +2045,76 @@ async def _run_full_crawl_async(
 
 import json as _json
 
-def _load_scan_cursor() -> int:
+def _get_scan_segments() -> list[tuple[int, "int | None"]]:
+    """取得 user_id 掃描分段；缺 config 時退回單段 (0, None) 相容舊行為。"""
+    segs = getattr(config, "USER_ID_SCAN_SEGMENTS", None)
+    if not segs:
+        return [(0, None)]
+    return [(int(s), (int(e) if e is not None else None)) for s, e in segs]
+
+
+def _load_scan_cursors() -> list[int]:
+    """載入每段的 cursor。
+    - 新格式：{"seg0": N, "seg1": M, ...}
+    - 舊格式（單 cursor）：{"cursor": N} → 自動遷移到 seg0，其餘段從 start 開始
+    """
     path = config.USER_ID_SCAN_CURSOR_FILE
+    segs = _get_scan_segments()
+    cursors: list[int] = [s for s, _ in segs]  # 預設為每段起點
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return int(_json.load(f).get("cursor", 0))
-    except Exception:
-        return 0
+            data = _json.load(f)
+    except FileNotFoundError:
+        return cursors
+    except Exception as e:
+        logger.warning(f"[掃描] 讀取 cursor 失敗，用預設起點: {e}")
+        return cursors
+
+    # 新格式
+    for i in range(len(segs)):
+        key = f"seg{i}"
+        if key in data:
+            try:
+                cursors[i] = max(int(data[key]), segs[i][0])
+            except Exception:
+                pass
+
+    # 舊格式遷移：單 "cursor" 欄位 → 放到 seg0
+    if "cursor" in data and "seg0" not in data:
+        try:
+            cursors[0] = max(int(data["cursor"]), segs[0][0])
+            logger.info(f"[掃描] 偵測到舊 cursor 格式，已遷移到 seg0={cursors[0]}")
+        except Exception:
+            pass
+
+    return cursors
+
+
+def _save_scan_cursors(cursors: list[int]) -> None:
+    path = config.USER_ID_SCAN_CURSOR_FILE
+    try:
+        data = {f"seg{i}": int(c) for i, c in enumerate(cursors)}
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump(data, f)
+    except Exception as e:
+        logger.warning(f"[掃描] 無法存進度: {e}")
+
+
+# 舊 API 相容（只回傳 seg0；仍被某些地方呼叫時不破壞行為）
+def _load_scan_cursor() -> int:
+    return _load_scan_cursors()[0]
 
 
 def _save_scan_cursor(cursor: int) -> None:
-    path = config.USER_ID_SCAN_CURSOR_FILE
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            _json.dump({"cursor": cursor}, f)
-    except Exception as e:
-        logger.warning(f"[掃描] 無法存進度: {e}")
+    cursors = _load_scan_cursors()
+    cursors[0] = int(cursor)
+    _save_scan_cursors(cursors)
 
 
 async def _user_id_scan_async(
     stop_event: threading.Event,
     api: AppPixivAPI,
     dl_headers: dict,
-    visited_users: set[int],
     on_success: "Callable[[dict], None]",
     api_lock: "threading.Lock | None" = None,
 ) -> None:
@@ -2106,14 +2163,14 @@ async def _user_id_scan_async(
             limit=config.DOWNLOAD_WORKERS * 3,
             enable_cleanup_closed=True,
             ttl_dns_cache=300,
+            ssl=_get_pximg_ssl_context(),
         )
         async with aiohttp.ClientSession(headers=dl_headers, connector=connector) as session:
             while not stop_event.is_set():
                 uid = await _next_id()
-                if uid in visited_users:
+                if await asyncio.to_thread(db.user_exists, uid):
                     await asyncio.sleep(0)  # yield，讓其他 task 執行
                     continue
-                visited_users.add(uid)
 
                 # 探測 user_detail（受 api_sem 序列化）
                 try:
@@ -2165,39 +2222,39 @@ def run_full_crawl(stop_event: threading.Event) -> None:
     db.init_db()
     Path(config.IMAGES_DIR).mkdir(parents=True, exist_ok=True)
     fe.init_live_index()
+    fe.init_nn_index()
     if fe.get_index_size() == 0:
         logger.info("FAISS 索引為空，從 DB 重建（含多頁）...")
         try:
             fe.build_faiss_index()
         except RuntimeError:
             pass
+    if fe.get_nn_index_size() == 0:
+        logger.info("NN 索引為空，從 DB 重建...")
+        try:
+            fe.build_nn_faiss_index()
+        except RuntimeError:
+            pass
 
     try:
-        api = _setup_api()
+        pool = _setup_api_pool()
     except Exception as e:
         logger.error(f"Pixiv 驗證失敗，爬取中止: {e}")
         return
 
+    api = pool[0]
     dl_headers = _get_dl_headers(api)
+    # pool 分配：[0]=main tag/ranking，[1]=scan（若有），[2:]=diffusion 並行 workers
+    scan_api = pool[1] if len(pool) >= 2 else None
+    scan_dl_headers = _get_dl_headers(scan_api) if scan_api else None
+    diffusion_pool = pool[2:] if len(pool) >= 3 else []
 
     async def _main():
-        # visited_users 在 tag 爬取與 user_scan 間共享，避免重複爬同一作者
-        visited_users: set[int] = await asyncio.to_thread(db.get_all_user_ids)
-
-        # 給 user_id_scan 建立獨立的 api 物件，避免與主爬蟲共用 requests.Session
-        # （requests.Session 不是 thread-safe，共用會導致 search_illust 回傳空結果）
-        try:
-            scan_api = await asyncio.to_thread(_setup_api)
-            scan_dl_headers = _get_dl_headers(scan_api)
-        except Exception as e:
-            logger.warning(f"掃描 API 驗證失敗，跳過 user_scan 批次: {e}")
-            scan_api = None
-            scan_dl_headers = None
-
         await _run_full_crawl_async(
-            stop_event, api, dl_headers, visited_users,
+            stop_event, api, dl_headers,
             scan_api=scan_api,
             scan_dl_headers=scan_dl_headers,
+            diffusion_pool=diffusion_pool,
         )
 
     asyncio.run(_main())
@@ -2243,6 +2300,7 @@ async def _crawl_user_async(
         limit=config.DOWNLOAD_WORKERS * 3,
         enable_cleanup_closed=True,
         ttl_dns_cache=300,
+        ssl=_get_pximg_ssl_context(),
     )
     async with aiohttp.ClientSession(headers=dl_headers, connector=connector) as session:
         await _process_batch_async(
@@ -2259,6 +2317,7 @@ async def _crawl_user_async(
         f"新增: {counters['downloaded']} | 跳過: {counters['skipped']} | 失敗: {counters['failed']}"
     )
     fe.flush_index()
+    fe.flush_nn_index()
     return user_name, counters["downloaded"], total
 
 
@@ -2271,10 +2330,17 @@ def crawl_user_by_id(
     db.init_db()
     Path(config.IMAGES_DIR).mkdir(parents=True, exist_ok=True)
     fe.init_live_index()
+    fe.init_nn_index()
     if fe.get_index_size() == 0:
         logger.info("FAISS 索引為空，從 DB 重建（含多頁）...")
         try:
             fe.build_faiss_index()
+        except RuntimeError:
+            pass
+    if fe.get_nn_index_size() == 0:
+        logger.info("NN 索引為空，從 DB 重建...")
+        try:
+            fe.build_nn_faiss_index()
         except RuntimeError:
             pass
 

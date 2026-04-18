@@ -38,9 +38,20 @@ if not GEMINI_API_KEYS and AI_PROVIDER_DEFAULT == "gemini":
     raise ValueError("❌ 缺少至少一組 GEMINI_API_KEY，請在 .env 中設定")
 
 # --- Pixiv（選填，設定後可使用爬取功能）---
-PIXIV_REFRESH_TOKEN: str = os.getenv("PIXIV_REFRESH_TOKEN", "")
+# 支援多組 refresh token，爬蟲會分配給 main/scan/diffusion workers 並行使用
+PIXIV_REFRESH_TOKENS: list[str] = [
+    t for t in [
+        os.getenv("PIXIV_REFRESH_TOKEN"),
+        os.getenv("PIXIV_REFRESH_TOKEN1"),
+        os.getenv("PIXIV_REFRESH_TOKEN2"),
+        os.getenv("PIXIV_REFRESH_TOKEN3"),
+    ]
+    if t
+]
+PIXIV_REFRESH_TOKEN: str = PIXIV_REFRESH_TOKENS[0] if PIXIV_REFRESH_TOKENS else ""
 PIXIV_WEB_COOKIE: str = os.getenv("PIXIV_WEB_COOKIE", "")
 NGROK_AUTH_TOKEN: str = os.getenv("NGROK_AUTH_TOKEN", "")
+NGROK_DOMAIN: str = os.getenv("NGROK_DOMAIN", "unmediative-shane-bewilderedly.ngrok-free.dev")
 
 # --- LINE Bot（選填，不設定則不啟動 LINE 功能）---
 LINE_CHANNEL_ACCESS_TOKEN: str = os.getenv('LINE_CHANNEL_ACCESS_TOKEN', '')

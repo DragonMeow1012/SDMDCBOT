@@ -15,8 +15,12 @@ from config import SAUCENAO_API_KEY
 
 # ── 常數 ────────────────────────────────────────────────────────────────────
 
-_PIXIV_LOCAL_THRESHOLD = 95.0    # pHash 相似度百分比（100 - Hamming/64*100）
+_PIXIV_LOCAL_THRESHOLD = 90.0    # pHash 相似度百分比（100 - Hamming/64*100）
 _PIXIV_LOCAL_TOP_K     = 1      # 最多回傳幾筆本地結果
+
+# NN binary hash 搜尋參數（抗裁剪/修圖/翻譯，512 bits）
+_NN_TOP_K          = 5      # 最多取幾個最近鄰
+_NN_HAMMING_MAX    = 125    # 512 bits 中 Hamming ≤125 視為命中（約 ≥75.6% 相似）
 
 _SAUCENAO_URL  = 'https://saucenao.com/search.php'
 _SOUTUBOT_BASE = 'https://soutubot.moe'
@@ -238,9 +242,68 @@ async def _soutubot_search(image_data: bytes, mime_type: str) -> list[dict]:
 
 # ── 本地 Pixiv FAISS 搜尋 ─────────────────────────────────────────────────────
 
+def _pixiv_nn_search(img, fe, db) -> list[dict]:
+    """
+    用 SSCD NN binary hash 做抗裁剪/修圖/翻譯搜尋。
+    單張 query → 1 個 512-bit hash → NN FAISS 找最近鄰。
+    """
+    import numpy as np
+
+    try:
+        nn_vec = fe.extract_nn_hash(img)  # shape=(64,) uint8
+        query = np.ascontiguousarray(nn_vec.reshape(1, -1), dtype=np.uint8)
+
+        index, id_list = fe.load_nn_faiss_index()
+        if index is None or not id_list:
+            print("[PIXIV_NN] NN 索引尚未建立，跳過")
+            return []
+
+        _NN_BITS = 512
+        k = min(_NN_TOP_K, index.ntotal)
+        distances, indices = index.search(query, k)
+
+        ranked = []
+        for hamming, idx in zip(distances[0], indices[0]):
+            if idx < 0 or int(hamming) > _NN_HAMMING_MAX:
+                continue
+            illust_id, page_index = fe.decode_id(int(id_list[idx]))
+            sim = round((1.0 - int(hamming) / _NN_BITS) * 100, 1)
+            ranked.append((illust_id, page_index, sim))
+
+        if not ranked:
+            print("[PIXIV_NN] 無候選")
+            return []
+
+        print(f"[PIXIV_NN] 候選 {len(ranked)} 個，前 3：")
+        for illust_id, page_index, sim in ranked[:3]:
+            print(f"  ID:{illust_id} p{page_index} sim={sim}%")
+
+        illust_id, page_index, sim = ranked[0]
+        row = db.get_artwork(illust_id)
+        if not row:
+            return []
+        return [{
+            'engine':     'Pixiv本地(NN)',
+            'source':     'pixiv',
+            'title':      row['title'],
+            'author':     row['user_name'],
+            'page':       str(page_index + 1),
+            'url':        f'https://www.pixiv.net/artworks/{illust_id}',
+            'similarity': sim,
+            '_illust_id': illust_id,
+            '_page_index': page_index,
+        }]
+
+    except Exception as e:
+        print(f"[PIXIV_NN] 搜尋失敗: {e}")
+        return []
+
+
 async def _pixiv_local_search(image_data: bytes) -> list[dict]:
     """
-    用 pHash 在本地 FAISS 二值索引（Hamming 距離）搜尋相似作品。
+    本地 Pixiv 搜尋：
+    1) 整圖 pHash FAISS（快、抗縮放、但對裁剪敏感）
+    2) 若主搜無高相似度命中，改用 SSCD NN binary hash 做抗裁剪/修圖/翻譯搜尋
     similarity = (64 - hamming) / 64 * 100，閾值 _PIXIV_LOCAL_THRESHOLD（百分比）。
     """
     try:
@@ -249,67 +312,88 @@ async def _pixiv_local_search(image_data: bytes) -> list[dict]:
         import pixiv_feature as fe
         import pixiv_database as db
 
-        # 提取查詢圖片的 pHash
         img = Image.open(io.BytesIO(image_data)).convert("RGB")
-        query_vec = fe.extract_phash(img).reshape(1, -1).astype(np.uint8)
 
-        # 載入 FAISS 二值索引
+        # ── 1. 整圖 pHash 搜尋 ──
+        query_vec = fe.extract_phash(img).reshape(1, -1).astype(np.uint8)
         index, id_list = fe.load_faiss_index()
         if index is None or not id_list:
-            print("[PIXIV_LOCAL] 索引尚未建立，跳過本地搜尋")
-            return []
+            print("[PIXIV_LOCAL] 主索引尚未建立，跳過整圖搜尋")
+            results: list[dict] = []
+        else:
+            k = min(_PIXIV_LOCAL_TOP_K, index.ntotal)
+            distances, indices = index.search(query_vec, k)
 
-        k = min(_PIXIV_LOCAL_TOP_K, index.ntotal)
-        distances, indices = index.search(query_vec, k)
+            _PHASH_BITS = 64
+            results = []
+            log_hits = []  # >80% 的命中，含連結，輸出至 log
+            for hamming, idx in zip(distances[0], indices[0]):
+                if idx < 0:
+                    continue
+                sim_pct = round((1.0 - hamming / _PHASH_BITS) * 100, 1)
+                encoded = id_list[idx]
+                illust_id, page_index = fe.decode_id(encoded)
 
-        _PHASH_BITS = 64
-        results = []
-        log_hits = []  # >80% 的命中，含連結，輸出至 log
-        for hamming, idx in zip(distances[0], indices[0]):
-            if idx < 0:
-                continue
-            sim_pct = round((1.0 - hamming / _PHASH_BITS) * 100, 1)
-            encoded = id_list[idx]
-            illust_id, page_index = fe.decode_id(encoded)
+                if sim_pct > 80.0:
+                    row = db.get_artwork(illust_id)
+                    if row:
+                        log_hits.append({
+                            'illust_id':  illust_id,
+                            'page_index': page_index,
+                            'title':      row['title'],
+                            'author':     row['user_name'],
+                            'similarity': sim_pct,
+                            'url':        f'https://www.pixiv.net/artworks/{illust_id}',
+                        })
 
-            if sim_pct > 80.0:
-                row = db.get_artwork(illust_id)
-                if row:
-                    log_hits.append({
-                        'illust_id':  illust_id,
-                        'page_index': page_index,
-                        'title':      row['title'],
-                        'author':     row['user_name'],
-                        'similarity': sim_pct,
-                        'url':        f'https://www.pixiv.net/artworks/{illust_id}',
-                    })
+                if sim_pct < _PIXIV_LOCAL_THRESHOLD:
+                    continue
+                hit = next((h for h in log_hits if h['illust_id'] == illust_id), None)
+                if hit is None:
+                    continue
+                results.append({
+                    'engine':      'Pixiv本地',
+                    'source':      'pixiv',
+                    'title':       hit['title'],
+                    'author':      hit['author'],
+                    'page':        str(page_index + 1),
+                    'url':         hit['url'],
+                    'similarity':  sim_pct,
+                    '_illust_id':  illust_id,
+                    '_page_index': page_index,
+                })
 
-            if sim_pct < _PIXIV_LOCAL_THRESHOLD:
-                continue
-            # ≥95% 必然已在 log_hits（因為 95 > 80），直接取已查好的 row
-            hit = next((h for h in log_hits if h['illust_id'] == illust_id), None)
-            if hit is None:
-                continue
-            results.append({
-                'engine':     'Pixiv本地',
-                'source':     'pixiv',
-                'title':      hit['title'],
-                'author':     hit['author'],
-                'page':       str(page_index + 1),
-                'url':        hit['url'],
-                'similarity': sim_pct,
-            })
+            if log_hits:
+                print(f"[PIXIV_LOCAL] 整圖 >80% 命中 {len(log_hits)} 筆：")
+                for res in log_hits:
+                    print(
+                        f"  [{res['similarity']}%] "
+                        f"ID:{res['illust_id']} p{res['page_index']} | "
+                        f"{res['title']} | {res['author']} | {res['url']}"
+                    )
+            print(f"[PIXIV_LOCAL] 整圖命中 {len(results)} 筆 ≥{_PIXIV_LOCAL_THRESHOLD:.0f}%")
 
-        if log_hits:
-            print(f"[PIXIV_LOCAL] >80% 命中 {len(log_hits)} 筆：")
-            for res in log_hits:
-                print(
-                    f"  [{res['similarity']}%] "
-                    f"ID:{res['illust_id']} p{res['page_index']} | "
-                    f"{res['title']} | {res['author']} | {res['url']}"
-                )
+        # ── 2. 若主搜無高相似度命中（≥95%），補 NN hash 搜尋抗裁剪 ──
+        strong = any(r['similarity'] >= 95.0 for r in results)
+        if not strong:
+            nn_hits = _pixiv_nn_search(img, fe, db)
+            if nn_hits:
+                # 以 (illust_id, page_index) 去重；主搜已存在就比較保留高相似度
+                existing = {(r.get('_illust_id'), r.get('_page_index')): r for r in results}
+                for nh in nn_hits:
+                    key = (nh.get('_illust_id'), nh.get('_page_index'))
+                    if key in existing:
+                        if nh['similarity'] > existing[key]['similarity']:
+                            existing[key].update(nh)
+                    else:
+                        results.append(nh)
 
-        print(f"[PIXIV_LOCAL] 命中 {len(results)} 筆 ≥{_PIXIV_LOCAL_THRESHOLD:.0f}%")
+        # 清掉內部欄位（`_` 開頭）再回傳，避免洩漏到 log/格式化
+        for r in results:
+            for k2 in list(r.keys()):
+                if k2.startswith('_'):
+                    r.pop(k2, None)
+
         return results
 
     except Exception as e:
@@ -332,7 +416,7 @@ def _format_result(i: int, r: dict) -> str:
     if page:
         parts.append(f'page {page}')
     parts.append(f'{sim:.1f}%')
-    return f'`{i}.` {" | ".join(parts)}\n連結:**{url}**'
+    return f'`{i}.` {" | ".join(parts)}\n連結:<{url}>'
 
 
 # ── 主搜尋入口 ────────────────────────────────────────────────────────────────

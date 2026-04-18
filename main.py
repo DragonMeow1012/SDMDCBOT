@@ -138,7 +138,8 @@ async def on_message(msg: discord.Message) -> None:
     if msg.author == client.user:
         return
 
-    mentioned: bool = client.user.mentioned_in(msg)
+    # 只認內文直接出現 <@bot_id> 的情況；raw_mentions 不包含 @everyone / @here / 回覆自動附帶的 ping
+    mentioned: bool = bool(client.user and client.user.id in msg.raw_mentions)
 
     # 移除 @提及，取得純文字
     raw_text: str = _strip_bot_mention(msg.content, client.user.id)

@@ -21,7 +21,7 @@ from pathlib import Path
 import discord
 from discord import app_commands
 
-from config import MASTER_ID, NGROK_AUTH_TOKEN
+from config import MASTER_ID, NGROK_AUTH_TOKEN, NGROK_DOMAIN
 import pixiv_database as db
 import pixiv_crawler as crawler
 from pixiv_config import STATUS_WEB_PORT
@@ -46,7 +46,7 @@ _heartbeat_stop_event: threading.Event | None = None
 _heartbeat_thread: threading.Thread | None = None
 
 _last_status_counters: dict = {}
-_priority_notice_requests: "dict[int, list[tuple[discord.Interaction, asyncio.AbstractEventLoop, str]]]" = {}
+_priority_notice_requests: "dict[int, list[tuple[discord.Interaction, asyncio.AbstractEventLoop, str, discord.WebhookMessage | None]]]" = {}
 _status_proc: "subprocess.Popen | None" = None
 _status_public_url: str = ""
 
@@ -104,11 +104,18 @@ async def _ensure_status_web_server() -> None:
         try:
             from pyngrok import ngrok, conf
             conf.get_default().auth_token = NGROK_AUTH_TOKEN
-            tunnel = await asyncio.to_thread(ngrok.connect, _STREAMLIT_PORT, "http")
+            connect_kwargs = {}
+            if NGROK_DOMAIN:
+                connect_kwargs["domain"] = NGROK_DOMAIN
+            tunnel = await asyncio.to_thread(
+                lambda: ngrok.connect(_STREAMLIT_PORT, "http", **connect_kwargs)
+            )
             _status_public_url = tunnel.public_url
             logger.info(f"ngrok 公開網址：{_status_public_url}")
         except Exception as e:
             logger.warning(f"ngrok 啟動失敗：{e}")
+            if NGROK_DOMAIN:
+                _status_public_url = f"https://{NGROK_DOMAIN}/"
 
     if not _status_public_url:
         _status_public_url = f"http://localhost:{_STREAMLIT_PORT}/"
@@ -193,9 +200,10 @@ def _register_priority_notice(
     interaction: discord.Interaction,
     loop: asyncio.AbstractEventLoop,
     author_label: str,
+    message: "discord.WebhookMessage | None" = None,
 ) -> None:
     requests = _priority_notice_requests.setdefault(user_id, [])
-    requests.append((interaction, loop, author_label))
+    requests.append((interaction, loop, author_label, message))
 
 
 def _clear_priority_notices() -> None:
@@ -206,6 +214,7 @@ async def _send_priority_done_notice(
     interaction: discord.Interaction,
     author_label: str,
     event: dict,
+    message: "discord.WebhookMessage | None" = None,
 ) -> None:
     status = event.get("status", "completed")
     if status == "error":
@@ -221,6 +230,13 @@ async def _send_priority_done_notice(
             f"失敗：{event.get('failed', 0)}"
         )
 
+    if message is not None:
+        try:
+            await message.edit(content=text)
+            return
+        except Exception as e:
+            logger.warning(f"優先作者 ephemeral 訊息編輯失敗 {event.get('user_id')}: {e}")
+
     try:
         await interaction.followup.send(text, ephemeral=True)
         return
@@ -234,10 +250,10 @@ def _dispatch_priority_done(event: dict) -> None:
     if not requests:
         logger.warning(f"優先作者完成但無待通知請求 user_id={user_id}")
         return
-    for interaction, loop, author_label in requests:
+    for interaction, loop, author_label, message in requests:
         try:
             fut = asyncio.run_coroutine_threadsafe(
-                _send_priority_done_notice(interaction, author_label, event),
+                _send_priority_done_notice(interaction, author_label, event, message),
                 loop,
             )
             def _log_future_result(f):
@@ -344,8 +360,8 @@ def setup(tree: app_commands.CommandTree) -> None:
                 message = f"作者 {author_label}（{uid}）已在優先佇列中"
             if started_now:
                 message = "Pixiv全站爬取已啟動，" + message
-            _register_priority_notice(uid, interaction, loop, author_label)
-            await interaction.followup.send(message, ephemeral=True)
+            sent_msg = await interaction.followup.send(message, ephemeral=True, wait=True)
+            _register_priority_notice(uid, interaction, loop, author_label, sent_msg)
 
         else:
             if _is_running():
