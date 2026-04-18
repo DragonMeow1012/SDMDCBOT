@@ -56,6 +56,35 @@ _STREAMLIT_PORT = STATUS_WEB_PORT
 HEARTBEAT_INTERVAL_SEC = 15
 HEARTBEAT_LOG_EVERY_SEC = 60
 
+_IS_WINDOWS = sys.platform == 'win32'
+# Windows：把 ngrok / Streamlit 子行程放進獨立 process group，避免子行程斷線時
+# 廣播 CTRL_BREAK_EVENT 到整個 console group 把主 Python 一起殺掉（觀察到
+# pyngrok session closed 後會同秒觸發主程式 KeyboardInterrupt 即為此原因）。
+_CREATE_NEW_PGROUP = subprocess.CREATE_NEW_PROCESS_GROUP if _IS_WINDOWS else 0
+_pyngrok_isolated = False
+
+
+def _isolate_pyngrok_from_console() -> None:
+    """在 Windows 上，把 pyngrok 啟動的 ngrok binary 隔離到獨立 process group。
+    pyngrok 的 start_new_session 僅作用於 POSIX，Windows 需自行覆寫 Popen 呼叫。"""
+    global _pyngrok_isolated
+    if _pyngrok_isolated or not _IS_WINDOWS:
+        return
+    _pyngrok_isolated = True
+
+    from pyngrok import process as _ngrok_process
+    _orig_sp = _ngrok_process.subprocess
+
+    class _IsolatedSP:
+        def __getattr__(self, name):
+            return getattr(_orig_sp, name)
+
+        def Popen(self, *args, **kwargs):
+            kwargs['creationflags'] = kwargs.get('creationflags', 0) | _CREATE_NEW_PGROUP
+            return _orig_sp.Popen(*args, **kwargs)
+
+    _ngrok_process.subprocess = _IsolatedSP()
+
 
 def _write_status_json(running_override: bool | None = None) -> None:
     try:
@@ -97,11 +126,13 @@ async def _ensure_status_web_server() -> None:
          "--server.address", "0.0.0.0"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        creationflags=_CREATE_NEW_PGROUP,
     )
     await asyncio.sleep(3)  # 等 Streamlit 啟動
 
     if NGROK_AUTH_TOKEN:
         try:
+            _isolate_pyngrok_from_console()
             from pyngrok import ngrok, conf
             conf.get_default().auth_token = NGROK_AUTH_TOKEN
             connect_kwargs = {}

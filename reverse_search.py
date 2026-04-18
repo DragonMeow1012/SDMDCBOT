@@ -20,7 +20,7 @@ _PIXIV_LOCAL_TOP_K     = 1      # 最多回傳幾筆本地結果
 
 # NN binary hash 搜尋參數（抗裁剪/修圖/翻譯，512 bits）
 _NN_TOP_K          = 5      # 最多取幾個最近鄰
-_NN_HAMMING_MAX    = 125    # 512 bits 中 Hamming ≤125 視為命中（約 ≥75.6% 相似）
+_NN_HAMMING_MAX    = 153    # 512 bits 中 Hamming ≤153 視為命中（約 ≥70.1% 相似）
 
 _SAUCENAO_URL  = 'https://saucenao.com/search.php'
 _SOUTUBOT_BASE = 'https://soutubot.moe'
