@@ -98,6 +98,14 @@ ALL_TAGS = list(dict.fromkeys([*ALL_TAGS, "セーラー服"]))
 # 80 頁 ≈ 2400 件，覆蓋 Pixiv 最新 ~1 小時（每小時 ~2000 件）
 NEW_ILLUSTS_MAX_PAGES: int = 80
 
+# ===== 全網最新 ID 前沿探測 =====
+# 持續往目前 DB 最大 illust_id 之後探測，捕捉剛上架的新作。
+# 與 illust_new 互補：前者有排序延遲，這條線透過 illust_detail 直接「點名」新 ID。
+FRONTIER_PROBE_INTERVAL: int = 300       # 探測間隔秒數（5 分鐘）
+FRONTIER_PROBE_BATCH: int = 20           # 每批探幾個 ID；命中 ≥1 就續探下一批
+FRONTIER_PROBE_MAX_PER_TICK: int = 500   # 單次 tick 最多探幾個 ID（防追趕失控）
+FRONTIER_STATE_FILE = os.path.join(DATA_DIR, "frontier_state.json")
+
 # ===== 圖片下載設定 =====
 # 偏好下載尺寸：
 #   "large"    → 1200px 長邊（master_1200），平均 ~400 KB，pHash 漂移 0–1 bits

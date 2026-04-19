@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile commands/artillery.py)",
+      "Bash(python -m py_compile logger.py)",
+      "Bash(python -c \"import pyngrok; print\\(pyngrok.__file__\\)\")",
+      "Bash(python -m py_compile main.py logger.py)",
+      "Bash(python -m py_compile pixiv_config.py pixiv_database.py pixiv_crawler/_core.py)",
+      "Bash(python -c \"import pixiv_crawler; print\\('reexport OK'\\); import main\")"
+    ]
+  }
+}

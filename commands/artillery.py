@@ -40,11 +40,14 @@ def setup(tree: app_commands.CommandTree) -> None:
                     await asyncio.wait_for(guild.chunk(), timeout=5.0)
                 except asyncio.TimeoutError:
                     pass
-            members = (
-                [m for m in channel.members if not m.bot]
-                if isinstance(channel, discord.TextChannel)
-                else [m for m in guild.members if not m.bot]
-            )
+            # 只從 guild.members 過濾，確保成員仍在伺服器（避免 stale cache 導致 mention 顯示成原始 ID）
+            if isinstance(channel, discord.TextChannel):
+                members = [
+                    m for m in guild.members
+                    if not m.bot and channel.permissions_for(m).view_channel
+                ]
+            else:
+                members = [m for m in guild.members if not m.bot]
             if not members:
                 await interaction.followup.send(
                     embed=discord.Embed(description='找不到可砲擊的對象喵...', color=discord.Color.red()),
@@ -52,6 +55,15 @@ def setup(tree: app_commands.CommandTree) -> None:
                 )
                 return
             victim = random.choice(members)
+            # 用 guild.get_member 重取最新 Member，避免抽到已離開伺服器的 stale 實例
+            fresh = guild.get_member(victim.id)
+            if fresh is None:
+                try:
+                    fresh = await guild.fetch_member(victim.id)
+                except discord.HTTPException:
+                    fresh = None
+            if fresh is not None:
+                victim = fresh
 
         # ── 更新紀錄 ────────────────────────────────────────────
         uid = str(victim.id)

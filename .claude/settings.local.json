@@ -62,7 +62,10 @@
       "Bash(kill 1035)",
       "Bash(python -c \"from PIL import Image; print\\(''Pillow OK''\\)\")",
       "Read(//c/Windows/Fonts/**)",
-      "Read(//d/vsc/pixiv_x_Spider/**)"
+      "Read(//d/vsc/pixiv_x_Spider/**)",
+      "Bash(python -c \"import pixiv_crawler, main\")",
+      "Bash(python -c \"import pixiv_crawler, main; from pixiv_crawler._core import _load_frontier_state; print\\('state:', _load_frontier_state\\(\\)\\)\")",
+      "Bash(curl -s http://127.0.0.1:4040/api/tunnels)"
     ]
   }
 }

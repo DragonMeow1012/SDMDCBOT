@@ -10,6 +10,8 @@ import os
 import sys
 import re
 import asyncio
+import signal
+import time
 import discord
 from discord import app_commands
 
@@ -21,6 +23,26 @@ if hasattr(sys.stderr, 'reconfigure'):
 
 from logger import setup_logger
 setup_logger()
+
+# Windows 上 pyngrok / streamlit 子行程斷線時常會把 CTRL 信號灌回主 console，
+# 單次 Ctrl+C 可能是假信號；要求 2 秒內連按兩次才真正關機。
+_SIGINT_CONFIRM_WINDOW = 2.0
+_last_sigint_ts = 0.0
+
+def _handle_shutdown_signal(signum, frame):
+    global _last_sigint_ts
+    now = time.time()
+    sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+    if now - _last_sigint_ts < _SIGINT_CONFIRM_WINDOW:
+        print(f'[STOP] 確認中斷（第二次 {sig_name}），關閉 bot...')
+        raise KeyboardInterrupt
+    _last_sigint_ts = now
+    print(f'[SIGNAL] 收到 {sig_name} — 若為手動關機請於 {_SIGINT_CONFIRM_WINDOW:g}s 內再按一次 Ctrl+C；'
+          '否則視為子行程洩漏的假信號，忽略。')
+
+signal.signal(signal.SIGINT, _handle_shutdown_signal)
+if hasattr(signal, 'SIGBREAK'):
+    signal.signal(signal.SIGBREAK, _handle_shutdown_signal)
 
 from config import DISCORD_TOKEN, MASTER_ID
 from history import load_history, save_history

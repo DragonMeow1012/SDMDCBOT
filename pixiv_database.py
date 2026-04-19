@@ -191,6 +191,13 @@ def search_by_ids(illust_ids: list[int]) -> list[sqlite3.Row]:
         ).fetchall()
 
 
+def max_illust_id() -> int:
+    """DB 中已存入的最大 illust_id；空表時回傳 0。"""
+    with get_connection() as conn:
+        row = conn.execute("SELECT MAX(illust_id) FROM artworks").fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
 def stats() -> dict:
     """統計作品數、下載數、gallery 頁數、nn_hash 頁數。"""
     with get_connection() as conn:

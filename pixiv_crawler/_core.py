@@ -389,6 +389,35 @@ def _save_ranking_state(state: dict) -> None:
         logger.warning(f"[ranking] 儲存每日狀態失敗: {e}")
 
 
+def _load_frontier_state() -> dict:
+    path = getattr(config, "FRONTIER_STATE_FILE", "")
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.warning(f"[frontier] 載入狀態失敗: {e}")
+        return {}
+
+
+def _save_frontier_state(max_id: int) -> None:
+    path = getattr(config, "FRONTIER_STATE_FILE", "")
+    if not path:
+        return
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({
+                "max_id": int(max_id),
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"[frontier] 儲存狀態失敗: {e}")
+
+
 async def _to_thread_with_timeout(func, *args, timeout: float | None = None, **kwargs):
     timeout = getattr(config, "PIXIV_API_TIMEOUT", 60.0) if timeout is None else timeout
     try:
@@ -1688,8 +1717,100 @@ async def _run_full_crawl_async(
         # 啟動優先監視器（整個 round 含 60s 等待期間都有效）
         _watcher_task = asyncio.create_task(_priority_watcher())
 
+        async def _frontier_probe_loop() -> None:
+            """持續探測「目前 DB 最大 illust_id 之後的候選 ID」以捕捉剛上架的新作。
+            每 tick（預設 5 分鐘）對 cur_max+1 往後逐一 illust_detail；只要一批命中 ≥1
+            就繼續探下一批，直到整批全 404（視為已追上 Pixiv 前沿）或達到單次上限。
+            命中的作品送進既有下載/索引管線；state 持久化到 FRONTIER_STATE_FILE。"""
+            st = _load_frontier_state()
+            cur_max = int(st.get("max_id") or 0)
+            if cur_max <= 0:
+                try:
+                    cur_max = await asyncio.to_thread(db.max_illust_id)
+                except Exception as e:
+                    logger.warning(f"[frontier] 取 DB max illust_id 失敗: {e}")
+                    cur_max = 0
+            logger.info(f"[frontier] 啟動，起始 max_id={cur_max}")
+
+            batch         = int(getattr(config, "FRONTIER_PROBE_BATCH", 20))
+            max_per_tick  = int(getattr(config, "FRONTIER_PROBE_MAX_PER_TICK", 500))
+            interval      = int(getattr(config, "FRONTIER_PROBE_INTERVAL", 300))
+
+            async def _sleep_responsive(seconds: int) -> None:
+                for _ in range(max(1, seconds)):
+                    if stop_event.is_set():
+                        return
+                    await asyncio.sleep(1)
+
+            while not stop_event.is_set():
+                if cur_max <= 0:
+                    await _sleep_responsive(interval)
+                    st = _load_frontier_state()
+                    cur_max = int(st.get("max_id") or 0)
+                    if cur_max <= 0:
+                        try:
+                            cur_max = await asyncio.to_thread(db.max_illust_id)
+                        except Exception:
+                            cur_max = 0
+                    continue
+
+                tick_start_max = cur_max
+                probed_total = 0
+                found_total = 0
+                # 追趕迴圈：整批全 404 才跳出（推測到達 Pixiv 前沿）
+                while probed_total < max_per_tick and not stop_event.is_set():
+                    found: list[dict] = []
+                    highest = cur_max
+                    chunk_start = cur_max
+                    for offset in range(1, batch + 1):
+                        if stop_event.is_set():
+                            break
+                        cand = chunk_start + offset
+                        try:
+                            async with api_detail_sem:
+                                result = await _to_thread_with_timeout(api.illust_detail, cand)
+                        except Exception as e:
+                            logger.debug(f"[frontier] probe {cand} 失敗: {e}")
+                            await asyncio.sleep(0.3)
+                            continue
+                        if result and "illust" in result:
+                            try:
+                                found.append(_parse_illust(result["illust"]))
+                                if cand > highest:
+                                    highest = cand
+                            except Exception as e:
+                                logger.debug(f"[frontier] parse {cand} 失敗: {e}")
+                        await asyncio.sleep(config.FULL_CRAWL_API_DELAY)
+                    probed_total += batch
+
+                    if not found:
+                        logger.info(f"[frontier] {chunk_start+1}~{chunk_start+batch} 全數未命中，本 tick 結束")
+                        break
+
+                    logger.info(
+                        f"[frontier] {chunk_start+1}~{chunk_start+batch} 命中 {len(found)} 件，max_id → {highest}"
+                    )
+                    try:
+                        await _process_bg(found, label=f"frontier:{chunk_start+1}~{chunk_start+batch}")
+                    except Exception as e:
+                        logger.warning(f"[frontier] 排程背景處理失敗: {e}")
+                    cur_max = highest
+                    found_total += len(found)
+                    _save_frontier_state(cur_max)
+
+                if probed_total >= max_per_tick:
+                    logger.info(f"[frontier] 達單 tick 上限 {max_per_tick}，下一 tick 繼續追趕")
+
+                if found_total:
+                    logger.info(
+                        f"[frontier] tick 完成：{tick_start_max} → {cur_max} "
+                        f"（探 {probed_total} 個，命中 {found_total}）"
+                    )
+                await _sleep_responsive(interval)
+
         # 分配 diffusion_pool：偶數位給 user_diff，奇數位給 related_diff
         _persistent_tasks: list[asyncio.Task] = []
+        _persistent_tasks.append(asyncio.create_task(_frontier_probe_loop(), name="frontier_probe"))
         if scan_api:
             _persistent_tasks.append(asyncio.create_task(_user_scan_loop(), name="user_scan_loop"))
         _user_diff_apis = [a for i, a in enumerate(diffusion_pool) if i % 2 == 0]

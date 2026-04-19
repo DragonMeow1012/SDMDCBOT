@@ -28,7 +28,7 @@ _TIMEOUT = aiohttp.ClientTimeout(total=15)
 _COLOR_NH = 0xED2553
 
 _PRESET_TAGS: tuple[str, ...] = (
-    'full-color','lolicon', 'yuri', 'kemonomimi',
+    'lolicon', 'yuri', 'kemonomimi', 'gender-bender'
 )
 
 

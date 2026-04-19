@@ -233,6 +233,22 @@ def setup(tree: app_commands.CommandTree) -> None:
             f'{用戶.mention}，{interaction.user.mention}（{req_name}）想認你為主人，你願意嗎？🐾',
             view=view)
 
+    @tree.command(name="放生寵物", description="解除與指定寵物的主寵關係🐾")
+    @app_commands.describe(用戶="要放生的寵物")
+    async def slash_release(interaction: discord.Interaction, 用戶: discord.Member):
+        data = load_json(_REL_FILE)
+        gid    = str(interaction.guild_id)
+        pet_id = str(用戶.id)
+        req_id = str(interaction.user.id)
+        if data.get(gid, {}).get(pet_id) != req_id:
+            await interaction.response.send_message(
+                f'{用戶.mention} 不是你的寵物喵！', ephemeral=True)
+            return
+        del data[gid][pet_id]
+        save_json(_REL_FILE, data)
+        await interaction.response.send_message(
+            f'🍃 {用戶.mention} 被 {interaction.user.mention} 放歸大自然了')
+
     @tree.command(name="本群關係圖", description="生成本伺服器主寵關係視覺圖🐾")
     async def slash_rel_map(interaction: discord.Interaction):
         guild = interaction.guild

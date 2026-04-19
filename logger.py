@@ -12,18 +12,25 @@ _LOG_DIR = os.path.join('data', 'logs')
 
 
 class _Tee:
-    """將寫入同時轉發到多個 stream。"""
-    def __init__(self, *streams):
-        self._streams = streams
+    """console 原樣輸出；log 檔每行前綴 [HH:MM:SS] 時間戳。"""
+    def __init__(self, console, log_file):
+        self._console = console
+        self._log = log_file
+        self._buffer = ''
 
     def write(self, data: str) -> None:
-        for s in self._streams:
-            s.write(data)
-            s.flush()
+        self._console.write(data)
+        self._console.flush()
+        self._buffer += data
+        while '\n' in self._buffer:
+            line, self._buffer = self._buffer.split('\n', 1)
+            ts = datetime.datetime.now().strftime('%H:%M:%S')
+            self._log.write(f'[{ts}] {line}\n')
+        self._log.flush()
 
     def flush(self) -> None:
-        for s in self._streams:
-            s.flush()
+        self._console.flush()
+        self._log.flush()
 
     def reconfigure(self, **kwargs) -> None:
         # 讓 main.py 裡的 reconfigure() 呼叫不報錯
