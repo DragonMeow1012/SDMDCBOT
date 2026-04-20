@@ -47,27 +47,49 @@ def suppress_url_embeds(text: str) -> str:
     return text
 
 
+_THINK_TAG_RE = re.compile(
+    r'<\s*(think|thinking|reasoning|analysis|scratchpad)\s*>[\s\S]*?<\s*/\s*\1\s*>',
+    flags=re.IGNORECASE,
+)
+_BRACKET_THINK_RE = re.compile(
+    r'\[\s*(THINKING|REASONING|ANALYSIS)\s*\][\s\S]*?\[\s*/\s*\1\s*\]',
+    flags=re.IGNORECASE,
+)
+_FINAL_POLISH_RE = re.compile(
+    r'Final\s+Polish\s*:.*\n+([\s\S]+)$',
+    flags=re.IGNORECASE,
+)
+
+_THINKING_MARKERS = (
+    'Drafting thoughts', 'Refining:', 'Refining for',
+    'Final answer:', 'Final response:', 'Final Polish:',
+    'Draft 1', 'Draft 2', 'Draft 3',
+    'Reaction:', 'Confirmation:', 'Action/Plea:',
+    'Persona:', 'Persona Check:', 'Context:', 'Constraints:',
+    'Relation to user:', 'Tone:',
+)
+
+
 def strip_thinking_output(text: str) -> str:
     """
     過濾 LM Studio 思考模型的推理過程，只保留最終回應。
     支援：
-    1. <think>...</think> 標籤（QwQ / DeepSeek-R1 等）
-    2. 結構化思考節（Drafting thoughts:、Refining:、Final Polish: 等）
+    1. <think>/<thinking>/<reasoning>/<analysis>/<scratchpad> 配對標籤
+    2. [THINKING]...[/THINKING] 方括號變體
+    3. Final Polish: 節標頭
+    4. 腳本式標頭（Reaction:、Draft 1:、Persona:、Constraints: 等）→ 擷取最後段落
     """
-    cleaned = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE).strip()
+    cleaned = _THINK_TAG_RE.sub('', text)
+    cleaned = _BRACKET_THINK_RE.sub('', cleaned).strip()
 
-    final_polish = re.search(
-        r'Final\s+Polish\s*:.*\n+([\s\S]+)$',
-        cleaned, re.IGNORECASE,
-    )
+    final_polish = _FINAL_POLISH_RE.search(cleaned)
     if final_polish:
         candidate = final_polish.group(1).strip()
         if candidate:
             print(f"[LMSTUDIO] 偵測到思考模型輸出，已擷取 Final Polish 後的內容（{len(candidate)} 字）")
             return candidate
 
-    thinking_markers = ('Drafting thoughts', 'Refining:', 'Final answer:', 'Final response:')
-    if any(m in cleaned for m in thinking_markers):
+    if any(m in cleaned for m in _THINKING_MARKERS):
         paragraphs = [p.strip() for p in re.split(r'\n\s*\n', cleaned) if p.strip()]
         if len(paragraphs) > 1:
             last = paragraphs[-1]

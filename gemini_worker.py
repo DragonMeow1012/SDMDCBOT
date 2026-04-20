@@ -29,6 +29,15 @@ _key_index: int = 0
 _client: genai.Client | None = None
 _lmstudio_model_cache: str | None = None
 
+_LMSTUDIO_NOTHINK_DIRECTIVE = (
+    "【輸出規則】直接輸出最終回應，僅使用繁體中文。"
+    "禁止輸出任何思考過程、推理步驟、草稿或自我分析；"
+    "禁止使用 <think>/<thinking>/<reasoning> 標籤或 [THINKING] 方括號；"
+    "禁止出現 Reaction、Confirmation、Action/Plea、Draft、Refining、"
+    "Persona、Context、Constraints、Final Polish 等英文分析標頭。"
+    "只回覆人格該說的話本身。\n\n"
+)
+
 
 def _create_client() -> genai.Client | None:
     if not GEMINI_API_KEYS:
@@ -331,6 +340,8 @@ async def gemini_worker(chat_sessions: dict, knowledge_entries: list | None = No
                         continue
 
                     system = PERSONALITY.get(personality, "")
+                    if system:
+                        system = _LMSTUDIO_NOTHINK_DIRECTIVE + system
                     messages: list[dict[str, str]] = ([{"role": "system", "content": system}] if system else [])
                     messages += _raw_history_to_text_messages(sess.get("raw_history", []))
                     messages.append({"role": "user", "content": prompt})
