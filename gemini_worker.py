@@ -4,6 +4,7 @@ Gemini API 工作器模組（使用新版 google-genai SDK）。
 """
 import asyncio
 import re
+import traceback
 from typing import Any
 
 import requests
@@ -19,6 +20,7 @@ from config import (
     LM_STUDIO_BASE_URL,
     LM_STUDIO_MODEL,
     LM_STUDIO_API_KEY,
+    LM_STUDIO_MAX_CONTEXT_CHARS,
 )
 from history import save_history_async
 from knowledge import add_entry, consolidate_knowledge
@@ -186,6 +188,31 @@ async def analyze_for_kb(raw_content: str) -> str:
 from utils.ai_helpers import normalize_provider as _normalize_provider
 
 
+def _trim_messages_for_lmstudio(messages: list[dict[str, str]],
+                                 budget: int) -> list[dict[str, str]]:
+    """
+    LM Studio 本地模型 context 有限，HISTORY_MAX_TURNS=150 容易爆。
+    保留 system（若存在，固定第 0 個）+ 最後一則 user prompt，從最舊歷史對開始刪到 budget 內。
+    """
+    if not messages:
+        return messages
+    has_system = messages[0].get("role") == "system"
+    sys_msg = messages[:1] if has_system else []
+    last_user = messages[-1:] if messages[-1].get("role") == "user" else []
+    middle = messages[len(sys_msg):len(messages) - len(last_user)]
+
+    def total_chars(msgs: list[dict[str, str]]) -> int:
+        return sum(len(m.get("content", "")) for m in msgs)
+
+    while middle and total_chars(sys_msg + middle + last_user) > budget:
+        del middle[0]
+    trimmed = sys_msg + middle + last_user
+    if len(trimmed) < len(messages):
+        print(f"[LMSTUDIO] 歷史過長，裁切 {len(messages) - len(trimmed)} 則 "
+              f"(剩 {total_chars(trimmed)} chars / budget {budget})")
+    return trimmed
+
+
 def _raw_history_to_text_messages(raw_history: list[dict]) -> list[dict[str, str]]:
     """
     將 {role, parts:[{text}]} 轉成 OpenAI chat messages 需要的 {role, content}。
@@ -259,7 +286,8 @@ def _lmstudio_chat_completion(messages: list[dict[str, str]]) -> str:
         "temperature": 0.7,
     }
     resp = requests.post(url, json=payload, headers=headers, timeout=120)
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        raise RuntimeError(f"LM Studio HTTP {resp.status_code}: {resp.text[:500]}")
     data: Any = resp.json()
     try:
         return str(data["choices"][0]["message"]["content"])
@@ -345,12 +373,14 @@ async def gemini_worker(chat_sessions: dict, knowledge_entries: list | None = No
                     messages: list[dict[str, str]] = ([{"role": "system", "content": system}] if system else [])
                     messages += _raw_history_to_text_messages(sess.get("raw_history", []))
                     messages.append({"role": "user", "content": prompt})
+                    messages = _trim_messages_for_lmstudio(messages, LM_STUDIO_MAX_CONTEXT_CHARS)
 
                     try:
                         text = await asyncio.to_thread(_lmstudio_chat_completion, messages)
                         _last_api_time = asyncio.get_running_loop().time()
                     except Exception as e:
                         print(f"[LMSTUDIO] ch={cid} error: {type(e).__name__}: {e}")
+                        traceback.print_exc()
                         try:
                             await reply_fn(f"LM Studio 呼叫失敗：{e}")
                         except Exception:
@@ -427,10 +457,17 @@ async def gemini_worker(chat_sessions: dict, knowledge_entries: list | None = No
                         break
 
                     except Exception as e:
-                        err = str(e).lower()
-                        if any(kw in err for kw in ["quota", "rate limit", "429", "resource_exhausted", "toomanyrequests"]):
+                        err = f"{type(e).__name__}: {e}".lower()
+                        is_quota = any(kw in err for kw in
+                                       ["quota", "rate limit", "429", "resource_exhausted", "toomanyrequests"])
+                        is_5xx = any(kw in err for kw in
+                                     ["500", "502", "503", "504", "internal error",
+                                      "unavailable", "servererror", "service_unavailable",
+                                      "deadline_exceeded", "internalservererror"])
+                        if is_quota or is_5xx:
                             if attempt < max_attempts - 1:
-                                print(f"[WARN] quota 觸發 ch={cid} attempt={attempt + 1}/{max_attempts}，輪替 Key...")
+                                tag = "quota" if is_quota else "5xx"
+                                print(f"[WARN] {tag} 觸發 ch={cid} attempt={attempt + 1}/{max_attempts}，輪替 Key...")
                                 rotate_api_key()
                                 if knowledge_entries is not None:
                                     consolidate_knowledge(knowledge_entries)
@@ -440,8 +477,12 @@ async def gemini_worker(chat_sessions: dict, knowledge_entries: list | None = No
                                 sess['raw_history'] = hist
                                 continue
                             else:
-                                print(f"[ERROR] 所有 {max_attempts} 組 Key 均已耗盡 ch={cid}")
-                                await reply_fn("所有 API Key 都達到用量限制了喵...請稍後再試！")
+                                if is_quota:
+                                    print(f"[ERROR] 所有 {max_attempts} 組 Key 均已耗盡 ch={cid}")
+                                    await reply_fn("所有 API Key 都達到用量限制了喵...請稍後再試！")
+                                else:
+                                    print(f"[ERROR] Gemini 5xx 重試 {max_attempts} 次仍失敗 ch={cid}: {e}")
+                                    await reply_fn("Gemini 伺服器目前不穩定（5xx），稍後再試喵...")
                         elif "timeout" in err:
                             print(f"[WARN] API逾時 ch={cid}: {e}")
                             await reply_fn("喵嗚...Gemini API 回應時間太長了，請稍後再試試看喔！")

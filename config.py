@@ -33,6 +33,10 @@ LM_STUDIO_BASE_URL: str = os.getenv("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234
 # 留空時會在第一次呼叫時自動從 /v1/models 抓第一個 id
 LM_STUDIO_MODEL: str = os.getenv("LM_STUDIO_MODEL", "").strip()
 LM_STUDIO_API_KEY: str = os.getenv("LM_STUDIO_API_KEY", "").strip()
+# 送進 LM Studio chat 的 messages 字元上限（system + history 合計）；
+# 超過會從最舊歷史開始刪。本地小模型 context 通常 8-32K tokens，CJK 約 2 char/token，
+# 預留 system prompt + 模型輸出後，保守用 12000 chars。
+LM_STUDIO_MAX_CONTEXT_CHARS: int = int(os.getenv("LM_STUDIO_MAX_CONTEXT_CHARS", "12000"))
 
 if not GEMINI_API_KEYS and AI_PROVIDER_DEFAULT == "gemini":
     raise ValueError("❌ 缺少至少一組 GEMINI_API_KEY，請在 .env 中設定")
@@ -70,6 +74,50 @@ SAUCENAO_API_KEY: str = os.getenv('SAUCENAO_API_KEY', '')
 # 啟動方式：imsearch --no-mmap server
 # 留空則停用本地搜圖功能
 IMSEARCH_URL: str = os.getenv('IMSEARCH_URL', 'http://127.0.0.1:8000')
+
+# --- manga-image-translator API server（漫畫翻譯後端）---
+# 預設啟動策略：bot 啟動時自動 spawn server 子進程，關閉時一起 terminate。
+# 想停用 autostart：MANGA_TRANSLATOR_AUTOSTART=0
+# 已經自己另外手動跑 server：autostart 邏輯會偵測 port 占用並跳過 spawn
+MANGA_TRANSLATOR_URL: str = os.getenv('MANGA_TRANSLATOR_URL', 'http://127.0.0.1:8001')
+MANGA_TRANSLATOR_AUTOSTART: bool = os.getenv('MANGA_TRANSLATOR_AUTOSTART', '1') in ('1', 'true', 'True')
+MANGA_TRANSLATOR_DIR: str = os.getenv(
+    'MANGA_TRANSLATOR_DIR',
+    r'd:\VScode\manga-image-translator',
+)
+# 預設用該 repo 自己的 venv，避免污染 bot 的 torch 版本。
+# 找不到時 fallback 到 bot 的 sys.executable（不建議）。
+MANGA_TRANSLATOR_PYTHON: str = os.getenv(
+    'MANGA_TRANSLATOR_PYTHON',
+    r'd:\VScode\manga-image-translator\.venv\Scripts\python.exe',
+)
+MANGA_TRANSLATOR_USE_GPU: bool = os.getenv('MANGA_TRANSLATOR_USE_GPU', '1') in ('1', 'true', 'True')
+
+# 翻譯後端：
+#   gemini_2stage = vision-capable LLM 先看圖修正 OCR + 抓劇情，再翻譯（走 OpenAI-compat
+#                   API 可指本地 LM Studio 或 Gemini 雲端）。台灣本土化 prompt + JSON schema。
+#   sakura        = SakuraLLM 日中專業 fine-tune（純文本、簡體輸出後做 OpenCC s2twp → 繁中）。
+#                   不吃 JSON 結構化 prompt，台灣本土化規則由 OpenCC + 字典提供。
+MANGA_TRANSLATOR_BACKEND: str = os.getenv('MANGA_TRANSLATOR_BACKEND', 'gemini_2stage')
+
+# 把 manga-translator 的 LLM 後端切到本地 LM Studio（預設 1）
+# 0 = 走 Gemini 雲端（吃 GEMINI_API_KEY*）
+MANGA_TRANSLATOR_USE_LOCAL: bool = os.getenv('MANGA_TRANSLATOR_USE_LOCAL', '1') in ('1', 'true', 'True')
+
+# 本地 LM Studio 的 OpenAI-compat endpoint（base URL 自動補 /v1）
+def _resolve_lmstudio_base() -> str:
+    lm = os.getenv('LM_STUDIO_BASE_URL', 'http://127.0.0.1:1234').rstrip('/')
+    return lm if lm.endswith('/v1') else f'{lm}/v1'
+
+MANGA_TRANSLATOR_OPENAI_API_BASE: str = _resolve_lmstudio_base()
+# LM Studio 上 loaded vision-capable model 的 identifier
+# Qwen3.5 9B（vision-capable）或其他多模態模型
+MANGA_TRANSLATOR_OPENAI_MODEL: str = os.getenv(
+    'MANGA_TRANSLATOR_OPENAI_MODEL', 'qwen2.5-vl-7b-instruct')
+
+# 同時可並行跑幾張。manga-translator 單 worker 每次只吃一張，
+# 設 >1 只是讓後續請求可以排進 server queue。
+MANGA_TRANSLATOR_CONCURRENCY: int = int(os.getenv('MANGA_TRANSLATOR_CONCURRENCY', '1'))
 
 # --- 本地資料儲存 ---
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")

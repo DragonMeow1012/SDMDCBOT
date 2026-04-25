@@ -51,6 +51,12 @@ _THINK_TAG_RE = re.compile(
     r'<\s*(think|thinking|reasoning|analysis|scratchpad)\s*>[\s\S]*?<\s*/\s*\1\s*>',
     flags=re.IGNORECASE,
 )
+# 部分模型只吐出結束標籤（前面 think 區塊未配對開頭），整段思考會直接外洩。
+# 出現孤立的 </think>/</thinking>/... 時，把它前面的內容整段丟掉。
+_ORPHAN_THINK_CLOSE_RE = re.compile(
+    r'^[\s\S]*?<\s*/\s*(think|thinking|reasoning|analysis|scratchpad)\s*>\s*',
+    flags=re.IGNORECASE,
+)
 _BRACKET_THINK_RE = re.compile(
     r'\[\s*(THINKING|REASONING|ANALYSIS)\s*\][\s\S]*?\[\s*/\s*\1\s*\]',
     flags=re.IGNORECASE,
@@ -80,7 +86,12 @@ def strip_thinking_output(text: str) -> str:
     4. 腳本式標頭（Reaction:、Draft 1:、Persona:、Constraints: 等）→ 擷取最後段落
     """
     cleaned = _THINK_TAG_RE.sub('', text)
-    cleaned = _BRACKET_THINK_RE.sub('', cleaned).strip()
+    cleaned = _BRACKET_THINK_RE.sub('', cleaned)
+    # 處理只有 </think> 沒有 <think> 的洩漏（剩餘文字若還含結束標籤就 strip 前段）
+    if re.search(r'<\s*/\s*(think|thinking|reasoning|analysis|scratchpad)\s*>',
+                 cleaned, flags=re.IGNORECASE):
+        cleaned = _ORPHAN_THINK_CLOSE_RE.sub('', cleaned, count=1)
+    cleaned = cleaned.strip()
 
     final_polish = _FINAL_POLISH_RE.search(cleaned)
     if final_polish:
