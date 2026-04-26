@@ -49,7 +49,10 @@ _LANG_CODE: dict[str, str] = {
 
 # 第一次請求 server 要載入 detection / OCR / inpaint 模型，可能 30-60s。
 # 之後常駐記憶體，後續請求 GPU 模式 ~3-8s/頁、CPU 模式 ~15-40s/頁。
-_TIMEOUT = aiohttp.ClientTimeout(total=300)
+# 上限 180s = 給冷啟動 60s + 慢圖 100s + 緩衝 20s；超過視為這張卡死，
+# 由上層（commands/translate.py 的 _one）catch 後跳下一張，不拖累整批。
+_PER_IMAGE_TIMEOUT = 300
+_TIMEOUT = aiohttp.ClientTimeout(total=_PER_IMAGE_TIMEOUT)
 
 # Worker 冷啟動時 server 會回 "Translation service is starting up" status=2 錯誤，
 # 不是真的失敗、就是還在載模型。第一張圖必中招——直接等待重試讓 user 層感覺不到。
@@ -222,6 +225,10 @@ async def translate_image(image_bytes: bytes, mime: str, target_lang: str) -> by
                         elapsed = time.monotonic() - started
                         print(f'[TRANSLATE] 完成 ({elapsed:.1f}s, 回傳 {len(data)/1024:.0f}KB)')
                         return data
+                except asyncio.TimeoutError:
+                    elapsed = time.monotonic() - started
+                    print(f'[TRANSLATE] 超時 ({elapsed:.1f}s > {_PER_IMAGE_TIMEOUT}s)，跳過這張')
+                    raise RuntimeError(f'這張圖翻譯超過 {_PER_IMAGE_TIMEOUT} 秒，已跳過')
                 except RuntimeError as e:
                     msg = str(e).lower()
                     if any(k in msg for k in _WARMUP_ERROR_KEYWORDS) and attempt < _WARMUP_RETRY_MAX - 1:

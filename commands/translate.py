@@ -8,6 +8,7 @@ Attachment 欄位讓使用者一次可以傳多張。並行上限由 manga_trans
 """
 import asyncio
 import io
+import time
 import traceback
 
 import aiohttp
@@ -15,6 +16,11 @@ import discord
 from discord import app_commands
 
 from manga_translate import translate_image
+
+
+# Discord interaction token 15 分鐘後失效，notice.edit() 會 401。
+# 超過這條線就改用 channel.send 發新訊息，避免長批次（webtoon／冷啟動）翻完丟不回去。
+_EDIT_DEADLINE = 720.0
 
 
 _LANG_CHOICES = [
@@ -85,6 +91,7 @@ def setup(tree: app_commands.CommandTree) -> None:
             f'小龍喵正在翻譯圖片喵...',
             wait=True,
         )
+        started = time.monotonic()
 
         async with aiohttp.ClientSession() as session:
             async def _one(idx: int, att: discord.Attachment, mime: str):
@@ -110,20 +117,30 @@ def setup(tree: app_commands.CommandTree) -> None:
                 continue
             files.append(discord.File(io.BytesIO(out), filename=f'translated_{idx}.png'))
 
+        elapsed = time.monotonic() - started
+        over_deadline = elapsed > _EDIT_DEADLINE
+
         lines: list[str] = []
-        if files:
-            lines.append('小龍喵幫你翻譯好了喵！')
-        else:
-            lines.append('翻譯全部失敗喵...')
+        head = '小龍喵幫你翻譯好了喵！' if files else '翻譯全部失敗喵...'
+        if over_deadline:
+            head += ' (本次翻譯時長超過12分鐘，避免舊訊息無法編輯已使用新messge)'
+        lines.append(head)
         if skipped:
             lines.append(f'跳過非圖片檔：{", ".join(skipped)}')
         if errors:
             lines.append('失敗：\n' + '\n'.join(errors))
         content = '\n'.join(lines)
 
+        # 超過 12 分鐘就直接發新訊息——followup token 已經接近／超過 15 分鐘上限，
+        # edit 多半會 401。channel.send 不依賴 interaction token，可以一直發。
+        if over_deadline:
+            print(f'[TRANSLATE] 翻譯耗時 {elapsed:.0f}s 超過 {_EDIT_DEADLINE:.0f}s，改發新訊息')
+            await interaction.channel.send(content=content, files=files)
+            return
+
         try:
             await notice.edit(content=content, attachments=files)
         except Exception as e:
-            print(f'[TRANSLATE] 編輯通知失敗、改用 followup: {type(e).__name__}: {e}')
+            print(f'[TRANSLATE] 編輯通知失敗、改用 channel.send: {type(e).__name__}: {e}')
             traceback.print_exc()
-            await interaction.followup.send(content=content, files=files)
+            await interaction.channel.send(content=content, files=files)
