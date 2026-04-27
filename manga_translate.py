@@ -72,28 +72,47 @@ _WARMUP_ERROR_KEYWORDS = ('starting up', 'starting up,')
 # 太低（如 4000-8000）會犧牲 webtoon 的文字解析度。
 _MAX_IMG_DIM = 12000
 
+# 下限：低於這個就放大。manga-translator 的 inpainter 邏輯是「只縮不放」，
+# 小圖（如 600x864）inpainter 直接在原解析度跑 → 文字渲染像素化／糊。
+# 客戶端預先放大到 _MIN_IMG_DIM 強制 inpainter 在合理解析度上跑。
+# 1280 = 比原始小圖大 ~1.3-1.5x，不會劇烈失真；inpainter 在 1280 跑字夠清楚。
+# 之前用 2048 對 867x1024 等小圖直接 2x 放大，過度。
+_MIN_IMG_DIM = 1280
 
-def _maybe_downscale(image_bytes: bytes, mime: str) -> tuple[bytes, str, int]:
+
+def _maybe_resize(image_bytes: bytes, mime: str) -> tuple[bytes, str, int]:
     """
-    單邊超過 _MAX_IMG_DIM 時等比縮，回傳 (新 bytes, 新 mime, 縮後最大邊)。
-    第三項用來決定 inpainting_size，等於圖實際最大邊→inpaint 不會再 resize → 不糊。
-    讀圖失敗時回傳 (原 bytes, 原 mime, 0)，inpainting_size 用 fallback。
+    把圖縮到 [_MIN_IMG_DIM, _MAX_IMG_DIM] 範圍：
+    - max_dim > _MAX_IMG_DIM → 等比縮（避免 OpenCV cv::remap 撞 SHRT_MAX）。
+    - max_dim < _MIN_IMG_DIM → 等比放大（避免 inpainter 在低解析度跑導致字糊）。
+    - 區間內 → 不動。
+    回傳 (bytes, mime, 處理後 max_dim)。讀圖失敗回傳原圖。
     """
     try:
         with Image.open(io.BytesIO(image_bytes)) as im:
             w, h = im.size
-            if max(w, h) <= _MAX_IMG_DIM:
-                return image_bytes, mime, max(w, h)
-            scale = _MAX_IMG_DIM / max(w, h)
+            cur_max = max(w, h)
+            if _MIN_IMG_DIM <= cur_max <= _MAX_IMG_DIM:
+                return image_bytes, mime, cur_max
+            if cur_max > _MAX_IMG_DIM:
+                scale = _MAX_IMG_DIM / cur_max
+                action = '縮小'
+            else:
+                scale = _MIN_IMG_DIM / cur_max
+                action = '放大（避免字糊）'
             new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
-            print(f'[TRANSLATE] 圖片 {w}x{h} 超過 {_MAX_IMG_DIM}，縮到 {new_size[0]}x{new_size[1]}')
+            print(f'[TRANSLATE] 圖片 {w}x{h} {action}到 {new_size[0]}x{new_size[1]}')
             resized = im.convert('RGB').resize(new_size, Image.LANCZOS)
             buf = io.BytesIO()
             resized.save(buf, format='PNG')
             return buf.getvalue(), 'image/png', max(new_size)
     except Exception as e:
-        print(f'[TRANSLATE] 縮圖失敗，沿用原圖: {type(e).__name__}: {e}')
+        print(f'[TRANSLATE] resize 失敗，沿用原圖: {type(e).__name__}: {e}')
         return image_bytes, mime, 0
+
+
+# 向下相容舊呼叫（如果有）
+_maybe_downscale = _maybe_resize
 
 
 async def _read_stream(resp: aiohttp.ClientResponse) -> bytes:
@@ -152,18 +171,18 @@ async def translate_image(image_bytes: bytes, mime: str, target_lang: str) -> by
             'post_check_max_retry_attempts': 0,
         },
         'detector': {
-            # default 保留：ctd 實測對細字／手寫敏感度比 default 還差（漏更多 region），
-            # dbconvnext 又沒提供模型權重 URL（upstream bug）。default + 全開。
+            # default (dbnet) 保留：ctd 實測對細字／手寫敏感度比 default 還差（漏更多 region），
+            # dbconvnext 又沒提供模型權重 URL（upstream bug）。default + 全開圖像增強。
             'detector': 'default',
             # 高解析度多撈小字／淡字／手寫字（4096 撞 OOM；3072 是穩定上限）
             'detection_size': 3072,
             # box 外擴比例。預設 2.3 會讓相鄰氣泡的 bbox 重疊→textline_merge
             # 把兩個氣泡併成一個 region（譯文跨氣泡黏在一起）。降到 1.5 讓
             # box 收斂只覆蓋實際文字，相近氣泡才能分開。
-            # 副作用：同氣泡內行距較大時可能切成多 region，由 textline_merge
-            # 的 char_gap_tolerance 接住，整體仍會合回同一框。
             'unclip_ratio': 1.5,
-            # 門檻再壓低（預設 0.5/0.7）→ 多撈淡墨／手寫／小字（寧濫勿漏）
+            # 門檻 0.15（預設 0.5/0.7）→ 多撈淡墨／手寫／小字。
+            # 試過 0.05 但會撈大量重疊小框，textline_merge 把它們合成大區域→ 譯文位置錯亂。
+            # 0.15 是「敏感但不破壞 region 結構」的平衡點。
             'text_threshold': 0.15,
             'box_threshold': 0.15,
             # 全開所有圖像增強選項：旋轉／反相／伽瑪 一次掃完
@@ -173,6 +192,13 @@ async def translate_image(image_bytes: bytes, mime: str, target_lang: str) -> by
             'det_gamma_correct': True, # 低對比掃描原稿、淡墨手寫
         },
         'ocr': {
+            # mocr (manga-ocr) = 漫畫專用 OCR 模型，對日文手寫／網點／壓縮字遠強於 48px。
+            # **這是「對話框漏翻」最有效的解法**——OCR 認不出整個 region 會被丟。
+            # 缺點：稍慢（每框約 +0.5s）、需下載模型（首次幾分鐘）。
+            'ocr': 'mocr',
+            # use_mocr_merge 不開：實測會把跨對話框的 region 亂合併導致位置錯亂。
+            # 下游 LLM 「多框連讀」prompt 已經能處理被切碎的長句。
+            'use_mocr_merge': False,
             # 單字對話「啊」「！」「？」也要保留（預設 min=2 會濾掉）
             'min_text_length': 1,
             # OCR 信心門檻：預設模型內部 ~0.5，壓到 0.05 連極模糊／極小字也認
@@ -180,14 +206,30 @@ async def translate_image(image_bytes: bytes, mime: str, target_lang: str) -> by
             # 不過濾非氣泡區的文字（旁白、SFX、效果文字）；0 = 全收
             'ignore_bubble': 0,
         },
+        'inpainter': {
+            # lama_mpe = 漫畫專用 LaMa（網點／線條優化），比預設 lama_large 對漫畫
+            # 場景的紋理重建更精細（衣服皺褶、頭髮陰影較不易塌成色塊）。
+            # LaMa 系列是純 vision 模型不吃 prompt；要 prompt 控制需換 SD inpainter，
+            # 但 SD 對 R18 內容會被 safety filter 擋且速度從幾秒→幾十秒/張，不採用。
+            'inpainter': 'lama_mpe',
+            # 從預設 2048 拉到 2560：解析度高 → 補的細節多，VRAM 多吃一點但不至於 OOM。
+            # 拉太高（>3072）容易爆顯存；2560 是品質/穩定性平衡點。
+            'inpainting_size': 2560,
+            # bf16 是 LaMa 預設精度，速度＋精度最佳平衡。
+            'inpainting_precision': 'bf16',
+        },
         'render': {
-            # 字級沿用 OCR 偵測到的原文字級（offset=0）。renderer 算出文字塞不下時
-            # 會自動 scale region；負 offset 會讓字偏小、留太多白邊（排不滿）。
+            # === 自適應氣泡框 ===
+            # offset 0：不主動縮也不主動放，由 __init__.py 內的長短譯文邏輯決定縮放
+            #   - 譯文比原文長 → 縮字（防超框）
+            #   - 譯文比原文短 → 放字（填滿氣泡，避免空白）
             'font_size_offset': 0,
-            # 中文不該斷字（連字號是西文渲染遺留）
+            # minimum 6px：極端 case 縮到這麼小仍可讀
+            'font_size_minimum': 6,
+            # 中文不斷字
             'no_hyphenation': True,
-            # line_spacing 不指定，走 renderer default（橫排 0.01／直排 0.2），
-            # 多行對白靠 region 自動擴張容納，不靠擠行距
+            # 多行各行頭對齊（不居中，避免短行內縮歪掉）
+            'alignment': 'left',
         },
     })
 

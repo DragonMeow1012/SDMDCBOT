@@ -167,6 +167,20 @@ def start() -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / 'manga_translator_server.log'
 
+    # 限大小：超過 _LOG_MAX_BYTES 滾動到 .old（覆蓋前一個 .old），新 log 從零開始 append。
+    # server 端 log 量大（每張 4-7 個 stage 各印幾十行），不滾動會無限長大。
+    _LOG_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+    old_log_path = log_dir / 'manga_translator_server.log.old'
+    try:
+        if log_path.exists() and log_path.stat().st_size > _LOG_MAX_BYTES:
+            if old_log_path.exists():
+                old_log_path.unlink()
+            log_path.rename(old_log_path)
+            print(f'[MANGA] log 超過 {_LOG_MAX_BYTES // 1024 // 1024}MB，'
+                  f'輪轉到 {old_log_path.name}，新 log 從零開始')
+    except OSError as e:
+        print(f'[MANGA] log 輪轉失敗（忽略繼續）: {e}')
+
     # GeminiTranslator 預設用已下架的 'gemini-1.5-flash-002'，強制蓋掉成現役型號
     # （setdefault 不夠保險 — 萬一系統環境繼承到別的舊值會中招）
     child_env = os.environ.copy()
