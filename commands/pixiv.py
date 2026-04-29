@@ -1,12 +1,9 @@
 """
-Pixiv 爬取指令模組
-- /pixiv爬蟲              開始全站背景爬取 
-- /pixiv爬蟲 作者ID       爬取指定作者的所有作品 
-- /pixiv停止              停止爬取（限主人）
-- /pixiv狀態              查看爬取狀態與統計（所有人）
+Pixiv 爬取指令模組（單一指令 /pixiv 選項:<功能>）
 
-作者ID 欄位填：
-  - Pixiv 作者的 user ID（數字）
+  /pixiv 選項:爬蟲 [author_id]   沒填 author_id = 全站背景爬取；填了則加入優先佇列
+  /pixiv 選項:狀態               查看爬取狀態與統計
+  /pixiv 選項:停止               停止背景爬取
 """
 import asyncio
 import json
@@ -17,6 +14,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 import discord
 from discord import app_commands
@@ -336,71 +334,34 @@ def _run_full(stop_event: threading.Event):
 # 指令註冊
 # ──────────────────────────────────────────────
 
-def setup(tree: app_commands.CommandTree) -> None:
+async def _pixiv_start(interaction: discord.Interaction, author_id: str) -> None:
+    global _stop_event, _crawl_thread
+    loop = asyncio.get_event_loop()
+    crawler.set_priority_user_done_hook(_dispatch_priority_done)
 
-    @tree.command(name="pixiv爬蟲", description="Pixiv 爬蟲")
-    @app_commands.describe(author_id="作者 user ID（數字）")
-    async def pixiv_start(interaction: discord.Interaction, author_id: str = ""):
-        global _stop_event, _crawl_thread
-        loop = asyncio.get_event_loop()
-        crawler.set_priority_user_done_hook(_dispatch_priority_done)
+    if author_id.strip():
+        raw = author_id.strip()
+        if not raw.isdigit():
+            await interaction.response.send_message('ID 必須是數字', ephemeral=True)
+            return
 
-        if author_id.strip():
-            raw = author_id.strip()
-            if not raw.isdigit():
-                await interaction.response.send_message("ID 必須是數字", ephemeral=True)
-                return
+        await interaction.response.defer(ephemeral=True)
 
-            await interaction.response.defer(ephemeral=True)
+        uid = int(raw)
+        try:
+            uname = await loop.run_in_executor(None, crawler.get_user_name, uid)
+            logger.info(f'作者 {uid} 的名稱：{uname}')
+        except Exception as e:
+            logger.warning(f'查詢作者 {uid} 名稱失敗: {e}')
+            uname = str(uid)
 
-            uid = int(raw)
-            try:
-                uname = await loop.run_in_executor(None, crawler.get_user_name, uid)
-                logger.info(f"作者 {uid} 的名稱：{uname}")
-            except Exception as e:
-                logger.warning(f"查詢作者 {uid} 名稱失敗: {e}")
-                uname = str(uid)
-
-            author_label = uname if uname != str(uid) else str(uid)
-            queued = await loop.run_in_executor(None, crawler.enqueue_priority_user, uid)
-            started_now = False
-            if not _is_running():
-                if not queued:
-                    crawler.clear_priority_queue()
-                    queued = await loop.run_in_executor(None, crawler.enqueue_priority_user, uid)
-                _clear_priority_notices()
-                _stop_event = threading.Event()
-                crawler.set_progress_hook(_dispatch_status_update, interval=5)
-                crawler.set_priority_user_done_hook(_dispatch_priority_done)
-                _crawl_thread = threading.Thread(
-                    target=_run_full,
-                    args=(_stop_event,),
-                    daemon=True,
-                    name="pixiv-crawler",
-                )
-                _crawl_thread.start()
-                _start_heartbeat()
-                try:
-                    await _ensure_status_web_server()
-                except Exception as e:
-                    logger.warning(f"啟動 Pixiv 狀態網站失敗: {e}")
-                started_now = True
-            if queued:
-                message = f"已將作者 {author_label}（{uid}）加入爬取佇列"
-            else:
-                message = f"作者 {author_label}（{uid}）已在優先佇列中"
-            if started_now:
-                message = "Pixiv全站爬取已啟動，" + message
-            sent_msg = await interaction.followup.send(message, ephemeral=True, wait=True)
-            _register_priority_notice(uid, interaction, loop, author_label, sent_msg)
-
-        else:
-            if _is_running():
-                await interaction.response.send_message("爬取已在執行中，請先使用 /pixiv停止", ephemeral=True)
-                return
-            await interaction.response.defer(ephemeral=True)
-
-            crawler.clear_priority_queue()
+        author_label = uname if uname != str(uid) else str(uid)
+        queued = await loop.run_in_executor(None, crawler.enqueue_priority_user, uid)
+        started_now = False
+        if not _is_running():
+            if not queued:
+                crawler.clear_priority_queue()
+                queued = await loop.run_in_executor(None, crawler.enqueue_priority_user, uid)
             _clear_priority_notices()
             _stop_event = threading.Event()
             crawler.set_progress_hook(_dispatch_status_update, interval=5)
@@ -409,50 +370,105 @@ def setup(tree: app_commands.CommandTree) -> None:
                 target=_run_full,
                 args=(_stop_event,),
                 daemon=True,
-                name="pixiv-crawler",
+                name='pixiv-crawler',
             )
             _crawl_thread.start()
             _start_heartbeat()
             try:
                 await _ensure_status_web_server()
             except Exception as e:
-                logger.warning(f"啟動 Pixiv 狀態網站失敗: {e}")
-            await interaction.followup.send(
-                "Pixiv全站爬取已啟動，將持續運行直到手動停止", ephemeral=True
-            )
+                logger.warning(f'啟動 Pixiv 狀態網站失敗: {e}')
+            started_now = True
+        if queued:
+            message = f'已將作者 {author_label}（{uid}）加入爬取佇列'
+        else:
+            message = f'作者 {author_label}（{uid}）已在優先佇列中'
+        if started_now:
+            message = 'Pixiv全站爬取已啟動，' + message
+        sent_msg = await interaction.followup.send(message, ephemeral=True, wait=True)
+        _register_priority_notice(uid, interaction, loop, author_label, sent_msg)
+        return
 
-    @tree.command(name="pixiv停止", description="停止 Pixiv 背景爬取")
-    async def pixiv_stop(interaction: discord.Interaction):
-        global _crawl_thread
-        if not _is_running():
-            await interaction.response.send_message("目前沒有正在執行的 Pixiv 爬蟲", ephemeral=True)
-            return
-
-        _stop_event.set()
-        crawler.set_progress_hook(None)
-        crawler.set_priority_user_done_hook(None)
-        crawler.clear_priority_queue()
-        _clear_priority_notices()
-        _last_status_counters.clear()
-        _write_status_json(running_override=False)
-        _stop_heartbeat()
+    if _is_running():
         await interaction.response.send_message(
-            "已送出停止請求，Pixiv 爬蟲會在目前工作收尾後停止", ephemeral=True
-        )
+            '爬取已在執行中，請先使用 /pixiv 選項:停止', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
 
-        def _cleanup():
-            global _crawl_thread
-            if _crawl_thread:
-                _crawl_thread.join(timeout=10)
-            if _crawl_thread and not _crawl_thread.is_alive():
-                _crawl_thread = None
-            _write_status_json(running_override=False)
-
-        threading.Thread(target=_cleanup, daemon=True).start()
-
-    @tree.command(name="pixiv狀態", description="查看 Pixiv 爬取狀態與統計")
-    async def pixiv_status(interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+    crawler.clear_priority_queue()
+    _clear_priority_notices()
+    _stop_event = threading.Event()
+    crawler.set_progress_hook(_dispatch_status_update, interval=5)
+    crawler.set_priority_user_done_hook(_dispatch_priority_done)
+    _crawl_thread = threading.Thread(
+        target=_run_full,
+        args=(_stop_event,),
+        daemon=True,
+        name='pixiv-crawler',
+    )
+    _crawl_thread.start()
+    _start_heartbeat()
+    try:
         await _ensure_status_web_server()
-        text = _build_status_text() + f"\n\n🌐 即時狀態頁：{_status_public_url}"
-        await interaction.followup.send(text, ephemeral=True)
+    except Exception as e:
+        logger.warning(f'啟動 Pixiv 狀態網站失敗: {e}')
+    await interaction.followup.send(
+        'Pixiv全站爬取已啟動，將持續運行直到手動停止', ephemeral=True)
+
+
+async def _pixiv_stop(interaction: discord.Interaction) -> None:
+    global _crawl_thread
+    if not _is_running():
+        await interaction.response.send_message('目前沒有正在執行的 Pixiv 爬蟲', ephemeral=True)
+        return
+
+    _stop_event.set()
+    crawler.set_progress_hook(None)
+    crawler.set_priority_user_done_hook(None)
+    crawler.clear_priority_queue()
+    _clear_priority_notices()
+    _last_status_counters.clear()
+    _write_status_json(running_override=False)
+    _stop_heartbeat()
+    await interaction.response.send_message(
+        '已送出停止請求，Pixiv 爬蟲會在目前工作收尾後停止', ephemeral=True)
+
+    def _cleanup():
+        global _crawl_thread
+        if _crawl_thread:
+            _crawl_thread.join(timeout=10)
+        if _crawl_thread and not _crawl_thread.is_alive():
+            _crawl_thread = None
+        _write_status_json(running_override=False)
+
+    threading.Thread(target=_cleanup, daemon=True).start()
+
+
+async def _pixiv_status_handler(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    await _ensure_status_web_server()
+    text = _build_status_text() + f'\n\n🌐 即時狀態頁：{_status_public_url}'
+    await interaction.followup.send(text, ephemeral=True)
+
+
+_PixivOption = Literal['爬蟲', '狀態', '停止']
+
+
+def setup(tree: app_commands.CommandTree) -> None:
+
+    @tree.command(name='pixiv', description='Pixiv 爬蟲控制')
+    @app_commands.describe(
+        選項='要執行的功能',
+        author_id='爬蟲用：作者 user ID（數字，可不填代表全站爬取）',
+    )
+    async def slash_pixiv(
+        interaction: discord.Interaction,
+        選項: _PixivOption,
+        author_id: str = '',
+    ):
+        if 選項 == '爬蟲':
+            await _pixiv_start(interaction, author_id)
+        elif 選項 == '停止':
+            await _pixiv_stop(interaction)
+        elif 選項 == '狀態':
+            await _pixiv_status_handler(interaction)

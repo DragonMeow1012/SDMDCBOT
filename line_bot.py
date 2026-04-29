@@ -193,7 +193,6 @@ async def _handle_webhook(
             'reply_fn': send_fn,
             'send_fn': send_fn,
             'typing_ctx': _NullTyping(),
-            'kb_save': None,
         })
 
         print(f'[LINE] ch={cid} prompt={prompt[:60]}')
@@ -203,7 +202,6 @@ async def _handle_webhook(
 
 async def start_line_server(
     chat_sessions: dict,
-    knowledge_entries: list,
     port: int,
     init_session_fn,
 ) -> None:

@@ -164,76 +164,51 @@ async def translate_image(image_bytes: bytes, mime: str, target_lang: str) -> by
         'translator': {
             'target_lang': code,
             'translator': MANGA_TRANSLATOR_BACKEND,
-            # 上游 page-/batch-level target language check 失敗時整批重打 N 次。
-            # 本地模型「重打」不會突然會翻譯，只是把 5K-token prompt 重打浪費時間。
-            # 設 0 = 第一次失敗就放棄，render 已得結果（多半是部份翻譯+原文），
-            # 比卡 5 分鐘有意義。雲端 Gemini 才需要 retry（網路抖動）。
+            # 0：第一次譯文驗證沒過直接放行；retry 會多打一輪 5K-token prompt 浪費時間。
             'post_check_max_retry_attempts': 0,
+            # 完全關掉 post-translation check：page-level target lang ratio 檢查每張多 500ms，
+            # 即使檢查失敗也只是 warning，不影響輸出，純粹浪費時間。
+            'enable_post_translation_check': False,
         },
         'detector': {
-            # default (dbnet) 保留：ctd 實測對細字／手寫敏感度比 default 還差（漏更多 region），
-            # dbconvnext 又沒提供模型權重 URL（upstream bug）。
             'detector': 'default',
-            # 速度優先：3072 → 1280（720p 等級）。detector dbnet 對 1280 仍有合理偵測力，
-            # 漫畫頁主對話氣泡都是大字會被抓到；極小腳註／淡墨手寫會漏（再個別調回）。
-            'detection_size': 1280,
-            # box 外擴比例。預設 2.3 太鬆 → bbox 跨氣泡／跨格子；
-            # 1.0 太緊 → polygon 漏邊緣字 + dst_points 比 inpaint mask 小 → 對話框被塗白但無字。
-            # 1.2：跨格較不會發生（DBNet polygon 不會延伸到鄰格），同時 polygon 涵蓋完整字符。
+            # 1024：從 1280 下調，DBNet 在 1024 對主氣泡仍可抓；省 ~30% detection 時間。
+            # 漫畫主對話氣泡字級夠大不會被漏；極小腳註若需要回 1280。
+            'detection_size': 1024,
             'unclip_ratio': 1.2,
-            # 門檻 0.15（預設 0.5/0.7）→ 多撈淡墨／手寫／小字。
-            # 試過 0.05 但會撈大量重疊小框，textline_merge 把它們合成大區域→ 譯文位置錯亂。
-            # 0.15 是「敏感但不破壞 region 結構」的平衡點。
-            'text_threshold': 0.15,
-            'box_threshold': 0.15,
-            # 圖像增強全關：每開一個 detector 多跑 1 趟。原本 4 個全開 = 6 趟。
-            # 漏字再個別開回，例如黑色對話框多就開 det_invert。
+            # 0.15 → 0.25：拉高過濾更多 false positive 小框，少幾個 region 就少幾次 OCR + LLM token。
+            'text_threshold': 0.25,
+            'box_threshold': 0.25,
+            'det_invert': False,
             'det_auto_rotate': False,
             'det_rotate': False,
-            'det_invert': False,
             'det_gamma_correct': False,
         },
         'ocr': {
-            # mocr (manga-ocr) = 漫畫專用 OCR 模型，對日文手寫／網點／壓縮字遠強於 48px。
-            # **這是「對話框漏翻」最有效的解法**——OCR 認不出整個 region 會被丟。
-            # 缺點：稍慢（每框約 +0.5s）、需下載模型（首次幾分鐘）。
+            # 此 fork 只保留 mocr（48px/48px_ctc 已移除）。
+            # mocr GPU 上每框 ~0.05-0.1s，18 框約 1-2s，瓶頸主要在 LLM 不在 OCR。
             'ocr': 'mocr',
-            # use_mocr_merge 不開：實測會把跨對話框的 region 亂合併導致位置錯亂。
-            # 下游 LLM 「多框連讀」prompt 已經能處理被切碎的長句。
             'use_mocr_merge': False,
-            # 單字對話「啊」「！」「？」也要保留（預設 min=2 會濾掉）
-            'min_text_length': 1,
-            # OCR 信心門檻：預設模型內部 ~0.5，壓到 0.05 連極模糊／極小字也認
-            'prob': 0.05,
-            # 不過濾非氣泡區的文字（旁白、SFX、效果文字）；0 = 全收
+            'min_text_length': 2,    # 1 → 2：丟單字噪訊（'!'、'?' 之類），少 OCR call
+            'prob': 0.2,             # 0.05 → 0.2：拉高過濾，少 region
             'ignore_bubble': 0,
         },
         'inpainter': {
-            # lama_mpe = 漫畫專用 LaMa（網點／線條優化），比預設 lama_large 對漫畫
-            # 場景的紋理重建更精細（衣服皺褶、頭髮陰影較不易塌成色塊）。
-            # LaMa 系列是純 vision 模型不吃 prompt；要 prompt 控制需換 SD inpainter，
-            # 但 SD 對 R18 內容會被 safety filter 擋且速度從幾秒→幾十秒/張，不採用。
             'inpainter': 'lama_mpe',
-            # 1792：對話框內補白（主要 inpaint 區）對解析度不敏感、白底紋理單純；
-            # 2560 → 1792 推理時間 -40%（GPU 工作量正比於 dim²）。
-            # 場景紋理重建（衣服皺褶、頭髮陰影）會稍粗，但漫畫翻譯主要在意對話框乾淨。
-            # 想恢復細節：拉回 2048-2560；極端品質：3072（慎防 OOM）。
-            'inpainting_size': 1792,
-            # bf16 是 LaMa 預設精度，速度＋精度最佳平衡。
+            # 1792 → 1280：LaMa 推理時間 ~ dim²，1280 比 1792 快 ~50%。
+            # 白底紋理單純的對話框幾乎看不出差別；複雜紋理場景才需要 1792+。
+            'inpainting_size': 1280,
             'inpainting_precision': 'bf16',
         },
         'render': {
-            # === 自適應氣泡框 ===
-            # offset 0：不主動縮也不主動放，由 __init__.py 內的長短譯文邏輯決定縮放
-            #   - 譯文比原文長 → 縮字（防超框）
-            #   - 譯文比原文短 → 放字（填滿氣泡，避免空白）
+            # offset=0：fit_check 已找出能塞進 bbox 的最大值，再 +offset 會直接溢框、字看起來「怪」。
+            # 想填滿氣泡靠的是 fit_check 把 size 拉到 bbox 上限，不是 offset。
             'font_size_offset': 0,
-            # minimum 14px：6 太小（中文 6px 等於看不見、視覺像空白對話框）。
-            # 14 是中文最小可讀字級；fit_check 算出 < 14 時硬抬到 14，寧可微出框也別空白。
+            # 14：中文最小可讀字級。-1（自動）對大圖會給更大值但小 bbox 會被夾大反而醜。
             'font_size_minimum': 14,
-            # 中文不斷字
+            # 字色：留空 = OCR per-region 自動偵測前景／背景（黑底白字、彩色字各自處理）。
             'no_hyphenation': True,
-            # 多行各行頭對齊（不居中，避免短行內縮歪掉）
+            # 多行各行頭對齊；改 center 對非對稱 bbox 會出現上下偏移看起來歪。
             'alignment': 'left',
         },
     })

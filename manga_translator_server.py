@@ -30,6 +30,7 @@ from config import (
     MANGA_TRANSLATOR_AUTOSTART,
     MANGA_TRANSLATOR_BACKEND,
     MANGA_TRANSLATOR_DIR,
+    MANGA_TRANSLATOR_FONT,
     MANGA_TRANSLATOR_GEMINI_MODEL,
     MANGA_TRANSLATOR_OPENAI_API_BASE,
     MANGA_TRANSLATOR_OPENAI_MODEL,
@@ -164,6 +165,19 @@ def start() -> None:
     if MANGA_TRANSLATOR_USE_GPU:
         cmd.append('--use-gpu')
 
+    # 字型偏好：server/main.py 不吃 --font-path 旗標，改走環境變數
+    # （會在下方 child_env 設置；text_render.set_font 端讀取，需要 upstream 配合）
+    font_full: 'Path | None' = None
+    if MANGA_TRANSLATOR_FONT:
+        candidate = repo / 'fonts' / MANGA_TRANSLATOR_FONT
+        if Path(MANGA_TRANSLATOR_FONT).is_absolute():
+            candidate = Path(MANGA_TRANSLATOR_FONT)
+        if candidate.is_file():
+            font_full = candidate
+            print(f'[MANGA] 使用字型: {font_full.name}')
+        else:
+            print(f'[MANGA] 警告：字型 {candidate} 不存在，沿用內建 fallback 順序')
+
     log_dir = Path('data') / 'logs'
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / 'manga_translator_server.log'
@@ -204,6 +218,11 @@ def start() -> None:
     # 強制 child Python 走 UTF-8（PYTHONUTF8 是 PEP 540 的 UTF-8 mode 開關）。
     child_env['PYTHONUTF8'] = '1'
     child_env['PYTHONIOENCODING'] = 'utf-8'
+
+    # 字型偏好走 env：upstream text_render.set_font 已 patch 為「沒給 font_path 就讀
+    # MANGA_TRANSLATOR_FONT_PATH」。沒 patch 時這個 env 無害（被忽略），bot 仍能跑。
+    if font_full is not None:
+        child_env['MANGA_TRANSLATOR_FONT_PATH'] = str(font_full)
 
     print(f'[MANGA] 啟動 server: {" ".join(cmd)}')
     if MANGA_TRANSLATOR_USE_LOCAL:

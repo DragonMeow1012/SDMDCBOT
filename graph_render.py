@@ -123,8 +123,19 @@ async def render_relation_graph(
     all_uids = set(G.nodes())
     name_map, avatar_map = await _collect_members(guild, all_uids)
 
+    # ── 密度自適應 ────────────────────────────────────────
+    # 基準 6 節點：用原本的尺寸／字級。
+    # 節點越多 → 畫布按 sqrt 放大、頭像/字體按 -0.35 次方縮小、spring k 微增推開連通群。
+    # 取上下限避免極端：超大群（>40 人）也不要把字縮到看不見。
+    n = max(1, len(all_uids))
+    density    = max(1.0, n / 6)
+    size_scale = min(density ** 0.5, 2.5)        # 6→1, 12→1.41, 24→2.0, 50→2.5
+    shrink     = max(density ** -0.35, 0.5)      # 6→1, 12→0.78, 24→0.61, 50→0.5
+    iters      = 50 if n <= 8 else 100
+
     # ── 版面配置 ─────────────────────────────────────────
-    pos = nx.spring_layout(G, seed=42, k=3.5)
+    # k 越大 → 節點之間想保持的距離越遠；節點多時微調以避免擠在一起
+    pos = nx.spring_layout(G, seed=42, k=3.5 * (density ** 0.15), iterations=iters)
 
     xs  = [v[0] for v in pos.values()]
     ys  = [v[1] for v in pos.values()]
@@ -132,7 +143,7 @@ async def render_relation_graph(
     x_min, x_max = min(xs) - pad, max(xs) + pad
     y_min, y_max = min(ys) - pad, max(ys) + pad
 
-    fig_w, fig_h = 16, 9
+    fig_w, fig_h = 16 * size_scale, 9 * size_scale
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=120)
 
     ax.set_facecolor('white')
@@ -143,22 +154,23 @@ async def render_relation_graph(
     ax.set_zorder(1)
 
     # ── 邊（箭頭） ────────────────────────────────────────
-    NODE_R = 0.22   # 節點半徑（軸單位）
+    NODE_R = 0.22 * shrink     # 節點半徑（軸單位）；隨密度縮小避免相鄰頭像重疊
+    edge_fs = max(11, int(16 * shrink))
 
     for u, v, edata in G.edges(data=True):
         x1, y1 = pos[u]
         x2, y2 = pos[v]
-        dx, dy  = x2 - x1, y2 - y1
-        dist    = math.hypot(dx, dy) or 1e-9
-        shrink  = NODE_R / dist
-        kind    = edata.get('kind', 'pet')
-        color   = '#F4A0B8' if kind == 'wife' else '#A8C8E8'
-        label   = '我媽'    if kind == 'wife' else '寵物'
+        dx, dy   = x2 - x1, y2 - y1
+        dist     = math.hypot(dx, dy) or 1e-9
+        edge_shrink = NODE_R / dist
+        kind     = edata.get('kind', 'pet')
+        color    = '#F4A0B8' if kind == 'wife' else '#A8C8E8'
+        label    = '我媽'    if kind == 'wife' else '寵物'
 
         ax.annotate(
             '', zorder=2,
-            xy    =(x2 - dx * shrink,  y2 - dy * shrink),
-            xytext=(x1 + dx * shrink,  y1 + dy * shrink),
+            xy    =(x2 - dx * edge_shrink,  y2 - dy * edge_shrink),
+            xytext=(x1 + dx * edge_shrink,  y1 + dy * edge_shrink),
             arrowprops=dict(
                 arrowstyle='-|>', color=color, lw=1.6,
                 mutation_scale=18,
@@ -169,13 +181,15 @@ async def render_relation_graph(
         if angle > 90 or angle < -90:
             angle += 180
         mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-        ax.text(mx, my, label, fontsize=16, color='#999999',
+        ax.text(mx, my, label, fontsize=edge_fs, color='#999999',
                 ha='center', va='center', rotation=angle,
                 fontfamily=_FONT, zorder=3)
 
     # ── 節點（頭像圓形） ───────────────────────────────────
-    AVATAR_ZOOM = 0.57   # 原 0.19 × 3
+    AVATAR_ZOOM = 0.57 * shrink   # 隨節點密度縮放
     BORDER_CLR  = '#A8C8E8'
+    name_fs = max(18, int(30 * shrink))
+    sub_fs  = max(11, int(14 * shrink))
 
     for uid, (x, y) in pos.items():
         if uid in avatar_map:
@@ -205,15 +219,15 @@ async def render_relation_graph(
 
         ax.text(
             x, y - NODE_R - 0.10, name,
-            fontsize=30, ha='center', va='top',
+            fontsize=name_fs, ha='center', va='top',
             fontfamily=_FONT, fontweight='bold', color='#333333',
             zorder=6,
             path_effects=[pe.withStroke(linewidth=3, foreground='white')],
         )
         if sub:
             ax.text(
-                x, y - NODE_R - 0.48, sub,
-                fontsize=14, ha='center', va='top',
+                x, y - NODE_R - 0.48 * shrink, sub,
+                fontsize=sub_fs, ha='center', va='top',
                 fontfamily=_FONT, color='#888888',
                 zorder=6,
                 path_effects=[pe.withStroke(linewidth=2, foreground='white')],

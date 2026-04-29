@@ -4,22 +4,30 @@ Commands 套件入口。
 """
 from discord import app_commands
 
-from commands import admin, nick, gag, fun, social, artillery, quote, search, kb, whip, wife, pixiv, ai, nhentai, translate
+from commands import (
+    admin,
+    ai,
+    image_search,
+    quote,
+    pixiv,
+    nhentai,
+    translate,
+    relationship,
+    tool,
+    rank,
+    daily_mom,
+)
 
 
 def setup_all(tree: app_commands.CommandTree) -> None:
     admin.setup(tree)
     ai.setup(tree)
-    nick.setup(tree)
-    gag.setup(tree)
-    fun.setup(tree)
-    social.setup(tree)
-    artillery.setup(tree)
+    image_search.setup(tree)
     quote.setup(tree)
-    search.setup(tree)
-    kb.setup(tree)
-    whip.setup(tree)
-    wife.setup(tree)
     pixiv.setup(tree)
     nhentai.setup(tree)
     translate.setup(tree)
+    relationship.setup(tree)
+    tool.setup(tree)
+    rank.setup(tree)
+    daily_mom.setup(tree)

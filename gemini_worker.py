@@ -23,7 +23,6 @@ from config import (
     LM_STUDIO_MAX_CONTEXT_CHARS,
 )
 from history import save_history_async
-from knowledge import add_entry, consolidate_knowledge
 from utils.text_processing import postprocess_response
 
 # --- API Key 輪替 ---
@@ -161,30 +160,6 @@ def _should_rebuild_chat(hist: list[dict]) -> bool:
     return len(hist) >= HISTORY_MAX_TURNS
 
 
-async def analyze_for_kb(raw_content: str) -> str:
-    """
-    使用 Gemini 分析並統整原始內容，回傳適合存入知識庫的摘要文字。
-    獨立呼叫（非 chat），不影響任何頻道對話歷史。
-    """
-    prompt = (
-        "請分析以下內容，提取關鍵資訊並整理為簡潔的繁體中文摘要，"
-        "方便日後查詢。保留重要數值、名稱、日期等細節，省略冗餘敘述：\n\n"
-        f"{raw_content[:8000]}"
-    )
-    try:
-        if _client is None:
-            return raw_content[:2000]
-        resp = await asyncio.to_thread(
-            _client.models.generate_content,
-            model=GEMINI_MODEL_NAME,
-            contents=prompt,
-        )
-        return resp.text.strip()
-    except Exception as e:
-        print(f"[KB] analyze_for_kb 失敗: {e}")
-        return raw_content[:2000]  # 分析失敗時 fallback 存原始內容
-
-
 from utils.ai_helpers import normalize_provider as _normalize_provider
 
 
@@ -307,29 +282,12 @@ async def _deliver_text(text: str, reply_fn, send_fn) -> None:
         await reply_fn(text)
 
 
-async def _auto_save_kb(kb_save: dict | None, text: str, send_fn) -> None:
-    """若有 kb_save 設定，自動將回應存入��識庫。"""
-    if not kb_save:
-        return
-    try:
-        entry = add_entry(
-            kb_save["entries"],
-            f"[圖片分析 {kb_save['label']}]: {text[:800]}",
-            kb_save["saved_by"],
-        )
-        await send_fn(
-            f"📌 圖片分析已自動儲存至知識庫 `#{entry['id']}`，之後可以直接問我喵！"
-        )
-    except Exception as e:
-        print(f"[KB] 自動儲存圖片分析失敗: {e}")
-
-
 # --- 請求佇列 ---
 msg_queue: asyncio.Queue = asyncio.Queue()
 _last_api_time: float = 0.0
 
 
-async def gemini_worker(chat_sessions: dict, knowledge_entries: list | None = None) -> None:
+async def gemini_worker(chat_sessions: dict) -> None:
     """
     持續從 msg_queue 取出請求並呼叫 Gemini API。
     確保 task_done() 在所有路徑皆被呼叫。
@@ -344,7 +302,6 @@ async def gemini_worker(chat_sessions: dict, knowledge_entries: list | None = No
         reply_fn = req['reply_fn']      # async fn(text) → 回覆原訊息
         send_fn = req['send_fn']        # async fn(text) → 發送至頻道（分段/通知用）
         typing_ctx = req['typing_ctx']  # async context manager（LINE 為 no-op）
-        kb_save: dict | None = req.get('kb_save')
 
         try:
             sess = chat_sessions.get(cid)
@@ -401,7 +358,6 @@ async def gemini_worker(chat_sessions: dict, knowledge_entries: list | None = No
                         del hist[:-HISTORY_MAX_TURNS]
                     sess["raw_history"] = hist
 
-                    await _auto_save_kb(kb_save, text, send_fn)
                     await save_history_async(chat_sessions)
                     continue
 
@@ -452,7 +408,6 @@ async def gemini_worker(chat_sessions: dict, knowledge_entries: list | None = No
                         except Exception as e:
                             print(f"[WARN] compact/rebuild chat 失敗 ch={cid}: {e}")
 
-                        await _auto_save_kb(kb_save, text, send_fn)
                         await save_history_async(chat_sessions)
                         break
 
@@ -469,8 +424,6 @@ async def gemini_worker(chat_sessions: dict, knowledge_entries: list | None = No
                                 tag = "quota" if is_quota else "5xx"
                                 print(f"[WARN] {tag} 觸發 ch={cid} attempt={attempt + 1}/{max_attempts}，輪替 Key...")
                                 rotate_api_key()
-                                if knowledge_entries is not None:
-                                    consolidate_knowledge(knowledge_entries)
                                 hist = _compact_history(chat)
                                 chat = create_chat(personality, hist)
                                 sess['chat_obj'] = chat

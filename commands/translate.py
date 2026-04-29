@@ -354,7 +354,7 @@ async def _handle_zip_flow(
         await notice.edit(content='壓縮檔內沒有任何圖片喵（支援 png/jpg/webp/gif/bmp）')
         return
 
-    await notice.edit(content=f'解壓完成 {total} 張，開始翻譯（一張約 2min）喵...')
+    await notice.edit(content=f'解壓完成 {total} 張，開始翻譯（一張約20秒）喵...')
     started = time.monotonic()
     done = 0
     fail = 0

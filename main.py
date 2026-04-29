@@ -6,7 +6,6 @@ Discord Bot 主程式入口。
 啟動方式：
     PYTHONIOENCODING=utf-8 python -u main.py
 """
-import io
 import os
 import sys
 import re
@@ -50,14 +49,9 @@ from history import load_history, save_history
 from web import fetch_url
 from gemini_worker import msg_queue, gemini_worker
 from ai_session import ensure_session
-from nicknames import load_nicknames, build_all_nicknames_summary
-from knowledge import (
-    load_knowledge, build_knowledge_context, consolidate_knowledge,
-)
 from reverse_search import reverse_image_search
 import state
 from commands import setup_all
-from commands.kb import handle_kb_command
 
 # ---------------------------------------------------------------------------
 # Discord Client
@@ -97,7 +91,6 @@ _MIME_BY_EXT: dict[str, str] = {
 
 # 預先編譯 hot-path 正規表達式，避免每次訊息都重建
 _URL_RE = re.compile(r'https?://[^\s\)\]\>\"\'`]+(?<![.,;:!?])')
-_KB_RE = re.compile(r'^!kb(\s|$)')
 
 
 def _is_source_query(text: str) -> bool:
@@ -143,17 +136,12 @@ async def on_ready() -> None:
     loaded = load_history()
     state.chat_sessions.update(loaded)
 
-    state.nicknames.update(load_nicknames())
-    state.knowledge_entries[:] = load_knowledge()
-    consolidate_knowledge(state.knowledge_entries)
-
     if not state._worker_started:
         state._worker_started = True
-        asyncio.create_task(gemini_worker(state.chat_sessions, state.knowledge_entries))
+        asyncio.create_task(gemini_worker(state.chat_sessions))
 
     await tree.sync()
-    print(f'[OK] Bot ready! {len(state.chat_sessions)} channels, '
-          f'{len(state.nicknames)} nicknames, {len(state.knowledge_entries)} KB entries.')
+    print(f'[OK] Bot ready! {len(state.chat_sessions)} channels.')
 
 
 @client.event
@@ -166,12 +154,6 @@ async def on_message(msg: discord.Message) -> None:
 
     # 移除 @提及，取得純文字
     raw_text: str = _strip_bot_mention(msg.content, client.user.id)
-
-    # !kb 指令攔截（不送 Gemini；不需要 @ 也能用）
-    if _KB_RE.match(raw_text):
-        args = raw_text[3:].strip()
-        await handle_kb_command(msg, args)
-        return
 
     # 只有被 @ 時才走 AI 對話流程
     if not mentioned:
@@ -192,21 +174,9 @@ async def on_message(msg: discord.Message) -> None:
 
     print(f'[MSG] ch={cid} [{personality}]: {raw_text[:80]}')
 
-    # 用戶身分前綴
-    uid_str      = str(msg.author.id)
-    nick         = state.nicknames.get(uid_str)
-    display_name = msg.author.display_name
-
-    if nick:
-        user_ctx = f'[用戶: {nick}]'
-    else:
-        user_ctx = f'[用戶: {display_name}]'
-
-    if is_master:
-        nick_summary    = build_all_nicknames_summary(state.nicknames)
-        identity_prefix = f'{nick_summary}\n{user_ctx}\n'
-    else:
-        identity_prefix = f'{user_ctx}\n'
+    # 用戶身分前綴（使用伺服器顯示名稱，不再使用 ID）
+    display_name    = msg.author.display_name
+    identity_prefix = f'[用戶: {display_name}]\n'
 
     prompt: str = raw_text if raw_text else '請描述這個附件的內容。'
 
@@ -277,9 +247,7 @@ async def on_message(msg: discord.Message) -> None:
     elif web_ctx := sess.get('current_web_context'):
         prompt = f'根據我之前讀取的內容：\n```\n{web_ctx}\n```\n請問：{prompt}'
 
-    # 注入知識庫
-    kb_ctx       = build_knowledge_context(state.knowledge_entries)
-    final_prompt = (kb_ctx + identity_prefix + prompt) if kb_ctx else (identity_prefix + prompt)
+    final_prompt = identity_prefix + prompt
 
     await msg_queue.put({
         'channel_id':  cid,
@@ -288,7 +256,6 @@ async def on_message(msg: discord.Message) -> None:
         'reply_fn':    msg.reply,
         'send_fn':     msg.channel.send,
         'typing_ctx':  msg.channel.typing(),
-        'kb_save':     None,
     })
 
 
@@ -306,8 +273,7 @@ async def _main() -> None:
     tasks = []
     if LINE_CHANNEL_ACCESS_TOKEN:
         tasks.append(asyncio.create_task(
-            start_line_server(state.chat_sessions, state.knowledge_entries,
-                              LINE_WEBHOOK_PORT, _init_session)
+            start_line_server(state.chat_sessions, LINE_WEBHOOK_PORT, _init_session)
         ))
 
     async with client:
