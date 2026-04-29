@@ -17,6 +17,7 @@ import os
 import time
 import traceback
 import zipfile
+from datetime import datetime, timezone
 
 import aiohttp
 import discord
@@ -143,18 +144,37 @@ def _extract_images_from_archive(
     return _extract_images_from_zip(archive_bytes)
 
 
+def _detect_format_ext(image_bytes: bytes) -> str:
+    """從 magic header 判副檔名（含點）。對應 server 端 mirror input format 的輸出。"""
+    if not image_bytes or len(image_bytes) < 12:
+        return '.png'
+    if image_bytes[:3] == b'\xff\xd8\xff':
+        return '.jpg'
+    if image_bytes[:8].startswith(b'\x89PNG'):
+        return '.png'
+    if image_bytes[:4] == b'RIFF' and image_bytes[8:12] == b'WEBP':
+        return '.webp'
+    if image_bytes[:6] in (b'GIF87a', b'GIF89a'):
+        return '.gif'
+    if image_bytes[:2] == b'BM':
+        return '.bmp'
+    return '.png'
+
+
 def _build_output_zip(results: list[tuple[int, str, bytes | None, str | None]]) -> bytes:
     """
-    把翻譯結果打包成 zip。輸入 list 元素：(idx, original_filename, png_bytes, err_str)。
-    err 不是 None 的略過。檔名格式 translated_001.png 用 idx 補零保證解壓後順序。
-    PNG 已壓縮過，用 ZIP_STORED 不再壓（速度快、檔案大小幾乎不變）。
+    把翻譯結果打包成 zip。輸入 list 元素：(idx, original_filename, image_bytes, err_str)。
+    err 不是 None 的略過。檔名格式 translated_001.<ext> 用 idx 補零保證解壓後順序，
+    副檔名從 image_bytes magic header 偵測（server 端 mirror input format）。
+    輸出位元組已壓縮，用 ZIP_STORED 不再壓（速度快、檔案大小幾乎不變）。
     """
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
         for idx, _name, out, err in results:
             if err is not None or out is None:
                 continue
-            zf.writestr(f'translated_{idx:03d}.png', out)
+            ext = _detect_format_ext(out)
+            zf.writestr(f'translated_{idx:03d}{ext}', out)
     return buf.getvalue()
 
 
@@ -260,7 +280,9 @@ def setup(tree: app_commands.CommandTree) -> None:
             files.append(discord.File(io.BytesIO(out), filename=f'translated_{idx}.png'))
 
         elapsed = time.monotonic() - started
-        over_deadline = elapsed > _EDIT_DEADLINE
+        # over_deadline 用 interaction.created_at 算（Discord token 15min 過期、按訊息發送瞬間起算）
+        interaction_age = (datetime.now(timezone.utc) - interaction.created_at).total_seconds()
+        over_deadline = interaction_age > _EDIT_DEADLINE
 
         lines: list[str] = []
         head = '小龍喵幫你翻譯好了喵！' if files else '翻譯全部失敗喵...'
@@ -332,17 +354,37 @@ async def _handle_zip_flow(
         await notice.edit(content='壓縮檔內沒有任何圖片喵（支援 png/jpg/webp/gif/bmp）')
         return
 
-    await notice.edit(content=f'解壓完成 {total} 張，開始翻譯（一張約 30s）喵...')
+    await notice.edit(content=f'解壓完成 {total} 張，開始翻譯（一張約 2min）喵...')
     started = time.monotonic()
+    done = 0
+    fail = 0
+    progress_lock = asyncio.Lock()
 
     async def _one(idx: int, name: str, data: bytes, mime: str):
+        nonlocal done, fail
         try:
             out = await translate_image(data, mime, target_lang)
+            result = (idx, name, out, None)
         except Exception as e:
             print(f'[TRANSLATE-ZIP] {name} 失敗: {type(e).__name__}: {e}')
             traceback.print_exc()
-            return idx, name, None, f'{type(e).__name__}: {e}'
-        return idx, name, out, None
+            result = (idx, name, None, f'{type(e).__name__}: {e}')
+        async with progress_lock:
+            if result[2] is not None:
+                done += 1
+            else:
+                fail += 1
+            finished = done + fail
+            elapsed = time.monotonic() - started
+            eta_str = ''
+            if 0 < finished < total:
+                avg = elapsed / finished
+                eta = avg * (total - finished)
+                eta_str = f'、預估還剩 {eta:.0f}s'
+            fail_str = f'（失敗 {fail}）' if fail else ''
+            print(f'[TRANSLATE-ZIP] 進度 {finished}/{total}{fail_str}'
+                  f' 已耗時 {elapsed:.0f}s{eta_str} ← {name}')
+        return result
 
     results = await asyncio.gather(
         *(_one(i, n, d, m) for i, (n, d, m) in enumerate(images, 1))
@@ -381,11 +423,13 @@ async def _handle_zip_flow(
 
     out_filename = (os.path.splitext(zip_att.filename)[0] or 'manga') + '_translated.zip'
     file = discord.File(io.BytesIO(out_zip_bytes), filename=out_filename)
-    over_deadline = elapsed > _EDIT_DEADLINE
+    # over_deadline 用 interaction.created_at 算（Discord token 15min 過期、按訊息發送瞬間起算）
+    interaction_age = (datetime.now(timezone.utc) - interaction.created_at).total_seconds()
+    over_deadline = interaction_age > _EDIT_DEADLINE
 
     if over_deadline:
-        print(f'[TRANSLATE-ZIP] 耗時 {elapsed:.0f}s 超過 {_EDIT_DEADLINE:.0f}s，改發新訊息')
-        await interaction.channel.send(content=content, files=[file])
+        print(f'[TRANSLATE-ZIP] interaction 已 {interaction_age:.0f}s（>{_EDIT_DEADLINE:.0f}s），改發新訊息')
+        await interaction.channel.send(content='翻譯完成了喵!', files=[file])
         return
 
     try:
@@ -393,4 +437,5 @@ async def _handle_zip_flow(
     except Exception as e:
         print(f'[TRANSLATE-ZIP] 編輯失敗、改用 channel.send: {type(e).__name__}: {e}')
         traceback.print_exc()
-        await interaction.channel.send(content=content, files=[file])
+        # interaction 過期才走到這 → 用簡短新訊息，stats 已在 log
+        await interaction.channel.send(content='翻譯完成了喵!', files=[file])

@@ -30,6 +30,7 @@ from config import (
     MANGA_TRANSLATOR_AUTOSTART,
     MANGA_TRANSLATOR_BACKEND,
     MANGA_TRANSLATOR_DIR,
+    MANGA_TRANSLATOR_GEMINI_MODEL,
     MANGA_TRANSLATOR_OPENAI_API_BASE,
     MANGA_TRANSLATOR_OPENAI_MODEL,
     MANGA_TRANSLATOR_PYTHON,
@@ -195,6 +196,10 @@ def start() -> None:
         # Gemini 雲端模式：GEMINI_API_KEY/KEY1..N 直接從 bot env 繼承
         if 'GEMINI_API_KEY' not in child_env and 'GOOGLE_API_KEY' in child_env:
             child_env['GEMINI_API_KEY'] = child_env['GOOGLE_API_KEY']
+        # 強制蓋掉模型名 — keys.py 預設 'gemini-1.5-flash-002' 已下架，
+        # 不蓋會直接 404；vision/text 用同一個 model（gemini-2.0-flash 都支援）
+        child_env['GEMINI_MODEL'] = MANGA_TRANSLATOR_GEMINI_MODEL
+        child_env['GEMINI_VISION_MODEL'] = MANGA_TRANSLATOR_GEMINI_MODEL
     # Windows 預設 console codepage cp950 寫日文/中文會變亂碼 → log 不可讀。
     # 強制 child Python 走 UTF-8（PYTHONUTF8 是 PEP 540 的 UTF-8 mode 開關）。
     child_env['PYTHONUTF8'] = '1'
@@ -205,7 +210,7 @@ def start() -> None:
         print(f'[MANGA] backend={MANGA_TRANSLATOR_BACKEND} → 本地 LM Studio '
               f'{MANGA_TRANSLATOR_OPENAI_API_BASE} (model={MANGA_TRANSLATOR_OPENAI_MODEL})')
     else:
-        print(f'[MANGA] backend={MANGA_TRANSLATOR_BACKEND} → Gemini 雲端')
+        print(f'[MANGA] backend={MANGA_TRANSLATOR_BACKEND} → Gemini 雲端 (model={MANGA_TRANSLATOR_GEMINI_MODEL})')
     print(f'[MANGA] log → {log_path}')
     log_fp = open(log_path, 'ab')
     _proc = subprocess.Popen(

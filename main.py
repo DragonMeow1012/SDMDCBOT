@@ -79,18 +79,6 @@ _SOURCE_KEYWORDS: frozenset[str] = frozenset({
     '找本子', '找本本', '番號', '號碼', '查本子',
 })
 
-_TRANSLATE_KEYWORDS: frozenset[str] = frozenset({
-    '翻譯', '中文化', '漢化', 'translate',
-})
-
-# 目標語言關鍵字（早 match 早結束；若都沒命中 → 預設繁體中文）
-_LANG_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
-    (('英文', '英語', 'english', '英譯'), 'English'),
-    (('日文', '日語', '日本語', 'japanese'), '日本語'),
-    (('簡體', '簡中', 'simplified'), '簡體中文'),
-    (('韓文', '韓語', 'korean'), '한국어'),
-)
-
 _INLINE_MIME_TYPES: frozenset[str] = frozenset({
     'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'application/pdf',
 })
@@ -115,19 +103,6 @@ _KB_RE = re.compile(r'^!kb(\s|$)')
 def _is_source_query(text: str) -> bool:
     lowered = text.lower()
     return any(kw in lowered for kw in _SOURCE_KEYWORDS)
-
-
-def _is_translate_query(text: str) -> bool:
-    lowered = text.lower()
-    return any(kw in lowered for kw in _TRANSLATE_KEYWORDS)
-
-
-def _detect_target_lang(text: str) -> str:
-    lowered = text.lower()
-    for hints, lang in _LANG_HINTS:
-        if any(h in lowered for h in hints):
-            return lang
-    return '繁體中文'
 
 
 def _guess_mime(filename: str) -> str:
@@ -237,17 +212,8 @@ async def on_message(msg: discord.Message) -> None:
 
     # 附件處理
     file_parts: list[dict] = []
-    translate_notice: discord.Message | None = None
     if msg.attachments:
-        # 先依意圖決定提示語句，避免「讀取中」+「翻譯中」兩條訊息
-        if _is_translate_query(prompt):
-            n_imgs = sum(
-                1 for a in msg.attachments
-                if (a.content_type or _guess_mime(a.filename)).split(';')[0].startswith('image/')
-            )
-            translate_notice = await msg.channel.send(
-                f'喵嗚~ 偵測到附件，正在翻譯（共 {n_imgs} 張）...')
-        elif _is_source_query(prompt):
+        if _is_source_query(prompt):
             await msg.channel.send('喵嗚~ 偵測到附件，正在以圖搜圖...')
         else:
             await msg.channel.send('喵嗚~ 偵測到附件，讀取中...')
@@ -279,39 +245,6 @@ async def on_message(msg: discord.Message) -> None:
                 await msg.reply(
                     f'喵嗚... 不支援 `{attachment.filename}` 的格式（{mime}），'
                     '目前支援：圖片（jpg/png/gif/webp）、PDF、文字檔。')
-
-    # 翻譯漫畫（關鍵字觸發；只翻譯圖片附件，PDF 等略過）
-    if file_parts and _is_translate_query(prompt):
-        image_parts = [fp for fp in file_parts if fp['mime_type'].startswith('image/')]
-        if image_parts:
-            target_lang = _detect_target_lang(prompt)
-            from manga_translate import translate_image
-            files: list[discord.File] = []
-            for idx, fp in enumerate(image_parts, 1):
-                try:
-                    out = await translate_image(fp['data'], fp['mime_type'], target_lang)
-                except Exception as e:
-                    print(f'[TRANSLATE] 第 {idx} 張失敗: {type(e).__name__}: {e}')
-                    await msg.reply(f'第 {idx} 張翻譯失敗：{type(e).__name__}: {e}')
-                    continue
-                files.append(discord.File(io.BytesIO(out), filename=f'translated_{idx}.png'))
-            if files:
-                # 把譯圖直接編輯回原通知訊息，不再另發訊息
-                done_text = '小龍喵幫你翻譯好了喵!'
-                if translate_notice is not None:
-                    try:
-                        await translate_notice.edit(content=done_text, attachments=files)
-                    except Exception as e:
-                        print(f'[TRANSLATE] 編輯通知失敗、改用 reply: {type(e).__name__}: {e}')
-                        await msg.reply(content=done_text, files=files)
-                else:
-                    await msg.reply(content=done_text, files=files)
-            elif translate_notice is not None:
-                try:
-                    await translate_notice.edit(content='翻譯全部失敗')
-                except Exception:
-                    pass
-            return
 
     # 以圖搜圖（關鍵字觸發）
     if file_parts and _is_source_query(prompt):

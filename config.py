@@ -104,6 +104,9 @@ MANGA_TRANSLATOR_BACKEND: str = os.getenv('MANGA_TRANSLATOR_BACKEND', 'gemini_2s
 # 0 = 走 Gemini 雲端（吃 GEMINI_API_KEY*）
 MANGA_TRANSLATOR_USE_LOCAL: bool = os.getenv('MANGA_TRANSLATOR_USE_LOCAL', '1') in ('1', 'true', 'True')
 
+# 走 Gemini 雲端時用的模型（keys.py 預設 'gemini-1.5-flash-002' 已下架，必須蓋掉）
+MANGA_TRANSLATOR_GEMINI_MODEL: str = os.getenv('MANGA_TRANSLATOR_GEMINI_MODEL', 'gemini-3.1-flash-lite-preview')
+
 # 本地 LM Studio 的 OpenAI-compat endpoint（base URL 自動補 /v1）
 def _resolve_lmstudio_base() -> str:
     lm = os.getenv('LM_STUDIO_BASE_URL', 'http://127.0.0.1:1234').rstrip('/')

@@ -172,24 +172,26 @@ async def translate_image(image_bytes: bytes, mime: str, target_lang: str) -> by
         },
         'detector': {
             # default (dbnet) 保留：ctd 實測對細字／手寫敏感度比 default 還差（漏更多 region），
-            # dbconvnext 又沒提供模型權重 URL（upstream bug）。default + 全開圖像增強。
+            # dbconvnext 又沒提供模型權重 URL（upstream bug）。
             'detector': 'default',
-            # 高解析度多撈小字／淡字／手寫字（4096 撞 OOM；3072 是穩定上限）
-            'detection_size': 3072,
-            # box 外擴比例。預設 2.3 會讓相鄰氣泡的 bbox 重疊→textline_merge
-            # 把兩個氣泡併成一個 region（譯文跨氣泡黏在一起）。降到 1.5 讓
-            # box 收斂只覆蓋實際文字，相近氣泡才能分開。
-            'unclip_ratio': 1.5,
+            # 速度優先：3072 → 1280（720p 等級）。detector dbnet 對 1280 仍有合理偵測力，
+            # 漫畫頁主對話氣泡都是大字會被抓到；極小腳註／淡墨手寫會漏（再個別調回）。
+            'detection_size': 1280,
+            # box 外擴比例。預設 2.3 太鬆 → bbox 跨氣泡／跨格子；
+            # 1.0 太緊 → polygon 漏邊緣字 + dst_points 比 inpaint mask 小 → 對話框被塗白但無字。
+            # 1.2：跨格較不會發生（DBNet polygon 不會延伸到鄰格），同時 polygon 涵蓋完整字符。
+            'unclip_ratio': 1.2,
             # 門檻 0.15（預設 0.5/0.7）→ 多撈淡墨／手寫／小字。
             # 試過 0.05 但會撈大量重疊小框，textline_merge 把它們合成大區域→ 譯文位置錯亂。
             # 0.15 是「敏感但不破壞 region 結構」的平衡點。
             'text_threshold': 0.15,
             'box_threshold': 0.15,
-            # 全開所有圖像增強選項：旋轉／反相／伽瑪 一次掃完
-            'det_auto_rotate': True,
-            'det_rotate': True,        # 雙方向都跑（垂直＋橫向）
-            'det_invert': True,        # 反白底字／白字黑底特效（夜景 SFX、黑色對話框）
-            'det_gamma_correct': True, # 低對比掃描原稿、淡墨手寫
+            # 圖像增強全關：每開一個 detector 多跑 1 趟。原本 4 個全開 = 6 趟。
+            # 漏字再個別開回，例如黑色對話框多就開 det_invert。
+            'det_auto_rotate': False,
+            'det_rotate': False,
+            'det_invert': False,
+            'det_gamma_correct': False,
         },
         'ocr': {
             # mocr (manga-ocr) = 漫畫專用 OCR 模型，對日文手寫／網點／壓縮字遠強於 48px。
@@ -212,9 +214,11 @@ async def translate_image(image_bytes: bytes, mime: str, target_lang: str) -> by
             # LaMa 系列是純 vision 模型不吃 prompt；要 prompt 控制需換 SD inpainter，
             # 但 SD 對 R18 內容會被 safety filter 擋且速度從幾秒→幾十秒/張，不採用。
             'inpainter': 'lama_mpe',
-            # 從預設 2048 拉到 2560：解析度高 → 補的細節多，VRAM 多吃一點但不至於 OOM。
-            # 拉太高（>3072）容易爆顯存；2560 是品質/穩定性平衡點。
-            'inpainting_size': 2560,
+            # 1792：對話框內補白（主要 inpaint 區）對解析度不敏感、白底紋理單純；
+            # 2560 → 1792 推理時間 -40%（GPU 工作量正比於 dim²）。
+            # 場景紋理重建（衣服皺褶、頭髮陰影）會稍粗，但漫畫翻譯主要在意對話框乾淨。
+            # 想恢復細節：拉回 2048-2560；極端品質：3072（慎防 OOM）。
+            'inpainting_size': 1792,
             # bf16 是 LaMa 預設精度，速度＋精度最佳平衡。
             'inpainting_precision': 'bf16',
         },
@@ -224,8 +228,9 @@ async def translate_image(image_bytes: bytes, mime: str, target_lang: str) -> by
             #   - 譯文比原文長 → 縮字（防超框）
             #   - 譯文比原文短 → 放字（填滿氣泡，避免空白）
             'font_size_offset': 0,
-            # minimum 6px：極端 case 縮到這麼小仍可讀
-            'font_size_minimum': 6,
+            # minimum 14px：6 太小（中文 6px 等於看不見、視覺像空白對話框）。
+            # 14 是中文最小可讀字級；fit_check 算出 < 14 時硬抬到 14，寧可微出框也別空白。
+            'font_size_minimum': 14,
             # 中文不斷字
             'no_hyphenation': True,
             # 多行各行頭對齊（不居中，避免短行內縮歪掉）
