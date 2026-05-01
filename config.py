@@ -125,9 +125,14 @@ MANGA_TRANSLATOR_OPENAI_API_BASE: str = _resolve_lmstudio_base()
 MANGA_TRANSLATOR_OPENAI_MODEL: str = os.getenv(
     'MANGA_TRANSLATOR_OPENAI_MODEL', 'qwen2.5-vl-7b-instruct')
 
-# 同時可並行跑幾張。manga-translator 單 worker 每次只吃一張，
-# 設 >1 只是讓後續請求可以排進 server queue。
-MANGA_TRANSLATOR_CONCURRENCY: int = int(os.getenv('MANGA_TRANSLATOR_CONCURRENCY', '1'))
+# 同時併發處理的圖片總數（bot 端 in-flight 上限 + orchestrator 註冊的 ExecutorInstance slot 總數）。
+# K=10 對應 N=2 worker × 5 slot/worker。priority lock 讓 post 永遠插隊 pre，K 大不會卡 post。
+MANGA_TRANSLATOR_CONCURRENCY: int = int(os.getenv('MANGA_TRANSLATOR_CONCURRENCY', '10'))
+
+# 同時跑幾個 manga-translator worker 進程。每個 worker 載自己一份模型到 VRAM。
+# 8G VRAM：N=2 安全（每 worker ~3GB，剩 2GB 緩衝）；N=3 邊緣會 OOM。
+# 每個 worker 內部 K/N 個 coroutine 並發（gpu_lock 序列化 GPU 階段、LLM 階段平行）。
+MANGA_TRANSLATOR_NUM_WORKERS: int = int(os.getenv('MANGA_TRANSLATOR_NUM_WORKERS', '2'))
 
 # --- 本地資料儲存 ---
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")

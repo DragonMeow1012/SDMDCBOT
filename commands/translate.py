@@ -164,17 +164,19 @@ def _detect_format_ext(image_bytes: bytes) -> str:
 def _build_output_zip(results: list[tuple[int, str, bytes | None, str | None]]) -> bytes:
     """
     把翻譯結果打包成 zip。輸入 list 元素：(idx, original_filename, image_bytes, err_str)。
-    err 不是 None 的略過。檔名格式 translated_001.<ext> 用 idx 補零保證解壓後順序，
-    副檔名從 image_bytes magic header 偵測（server 端 mirror input format）。
-    輸出位元組已壓縮，用 ZIP_STORED 不再壓（速度快、檔案大小幾乎不變）。
+    err 不是 None 的略過。
+
+    檔名完全沿用原 zip 的檔名（含副檔名）。server 端 mirror input format → 輸出格式
+    跟輸入一致（webp 進就 webp 出），所以延用原檔名安全。原檔名缺失才退回 translated_001。
+    輸出 zip 用 ZIP_STORED 不再壓（每張本身已是壓縮過的 webp/jpg/png）。
     """
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
-        for idx, _name, out, err in results:
+        for idx, name, out, err in results:
             if err is not None or out is None:
                 continue
-            ext = _detect_format_ext(out)
-            zf.writestr(f'translated_{idx:03d}{ext}', out)
+            out_name = name if name else f'translated_{idx:03d}{_detect_format_ext(out)}'
+            zf.writestr(out_name, out)
     return buf.getvalue()
 
 

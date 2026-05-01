@@ -33,9 +33,9 @@ from config import (
     MANGA_TRANSLATOR_URL,
 )
 
-# client-side 並行閘門。server 端單 worker 還是會在 pipeline 序列化，
-# 但允許 N 個請求同時進 server queue（status 3/4 會回報排隊位置），
-# 本地 LM Studio 沒 rate limit，這條只避免無限塞滿 queue。
+# Bot 端 in-flight 上限。Pipeline 模式下 server 真的會 overlap GPU/LLM/GPU 三 stage，
+# 設高才能餵滿 server。Server 端 gpu_sem(1) + llm_sem(N) 自己會排隊，bot 設多大都不會炸 GPU。
+# 預設 8 = 1 pre + 4 LLM + 1 post + 2 buffer，30 張 manga 走完約 4-5 分鐘。
 _WORKER_SEM = asyncio.Semaphore(MANGA_TRANSLATOR_CONCURRENCY)
 
 # 中文人類名 → manga-image-translator 用的 ISO 代碼
@@ -48,18 +48,16 @@ _LANG_CODE: dict[str, str] = {
 }
 
 # 第一次請求 server 要載入 detection / OCR / inpaint 模型，可能 30-60s。
-# 之後常駐記憶體，後續請求 GPU 模式 ~3-8s/頁、CPU 模式 ~15-40s/頁。
-# 上限 180s = 給冷啟動 60s + 慢圖 100s + 緩衝 20s；超過視為這張卡死，
-# 由上層（commands/translate.py 的 _one）catch 後跳下一張，不拖累整批。
-_PER_IMAGE_TIMEOUT = 300
+# K=10 並發下，後到的圖在 worker gpu_lock queue 排隊可能 ~3-5 分鐘才輪到。
+# 600s = 冷啟動 60s + worker 排隊上限 ~5 分鐘 + 慢圖（LLM 偶發掛 100s）+ 緩衝。
+# 超過視為真卡死，由 commands/translate.py 的 _one catch 跳下一張不拖累整批。
+_PER_IMAGE_TIMEOUT = 600
 _TIMEOUT = aiohttp.ClientTimeout(total=_PER_IMAGE_TIMEOUT)
 
-# Worker 冷啟動時 server 會回 "Translation service is starting up" status=2 錯誤，
-# 不是真的失敗、就是還在載模型。第一張圖必中招——直接等待重試讓 user 層感覺不到。
-# 12 次 × 5s = 最多等 60s 給 worker 暖機，超過就放棄當真錯。
+# Worker 冷啟動時 orchestrator 還沒收到 worker /register（503）或 worker 在載模型（500 + 'starting up'）。
+# 第一張圖必中招——退避重試讓 user 感覺不到。12 × 5s = 最多等 60s 暖機，超過視為真錯。
 _WARMUP_RETRY_MAX = 12
 _WARMUP_RETRY_DELAY = 5.0
-_WARMUP_ERROR_KEYWORDS = ('starting up', 'starting up,')
 
 # OpenCV cv::remap 用 16-bit signed indices，SHRT_MAX=32767。manga-translator pipeline
 # 內部 resize 過程容易讓任一維度撞到上限（特別是長條 webtoon），會 raise:
@@ -115,54 +113,15 @@ def _maybe_resize(image_bytes: bytes, mime: str) -> tuple[bytes, str, int]:
 _maybe_downscale = _maybe_resize
 
 
-async def _read_stream(resp: aiohttp.ClientResponse) -> bytes:
+def _build_config_payload(target_lang_code: str) -> str:
     """
-    從 streaming endpoint 累積 chunk 直到拿到最終結果（status 0）或錯誤（status 2）。
-    其他 status（progress / queue pos / waiting）只用來印 log。
+    產出 manga-translator config JSON。各參數調校 rationale 看底下註解。
+    重點是「不漏字」。detector/OCR 拉低門檻多撈一點，
+    寧可多幾個雜訊 box（gemini 看圖會把雜訊修正成空字串自然濾掉），也不要漏對話。
     """
-    buffer = b''
-    async for chunk in resp.content.iter_any():
-        if not chunk:
-            continue
-        buffer += chunk
-        # 一個 chunk 可能塞多個 message 也可能不滿一個 message，loop 解析
-        while len(buffer) >= 5:
-            status = buffer[0]
-            size = int.from_bytes(buffer[1:5], 'big')
-            if len(buffer) < 5 + size:
-                break  # 等下一個 chunk
-            payload = buffer[5:5 + size]
-            buffer = buffer[5 + size:]
-
-            if status == 0:
-                return payload  # 最終 PNG bytes
-            if status == 2:
-                raise RuntimeError(f'manga-translator worker error: {payload.decode("utf-8", errors="replace")[:300]}')
-            if status == 1:
-                try:
-                    print(f'[TRANSLATE]   進度: {payload.decode("utf-8", errors="replace")[:120]}')
-                except Exception:
-                    pass
-            elif status == 3:
-                print(f'[TRANSLATE]   排隊位置: {payload.decode("utf-8", errors="replace")}')
-            elif status == 4:
-                print('[TRANSLATE]   等待 worker 取件...')
-    raise RuntimeError('manga-translator stream 結束但未收到結果')
-
-
-async def translate_image(image_bytes: bytes, mime: str, target_lang: str) -> bytes:
-    """
-    把漫畫圖丟到 manga-image-translator server 翻譯，回傳翻譯後 PNG bytes。
-
-    target_lang：接受 _LANG_CODE 內的中文鍵名（'繁體中文' 等），未知值預設 CHT。
-    """
-    image_bytes, mime, _ = await asyncio.to_thread(_maybe_downscale, image_bytes, mime)
-    code = _LANG_CODE.get(target_lang, 'CHT')
-    # 重點是「不漏字」。detector/OCR 都拉低門檻多撈一點，
-    # 寧可多撈幾個雜訊 box（gemini 看圖會把雜訊修正成空字串自然濾掉），也不要漏對話。
-    config_payload = json.dumps({
+    return json.dumps({
         'translator': {
-            'target_lang': code,
+            'target_lang': target_lang_code,
             'translator': MANGA_TRANSLATOR_BACKEND,
             # 0：第一次譯文驗證沒過直接放行；retry 會多打一輪 5K-token prompt 浪費時間。
             'post_check_max_retry_attempts': 0,
@@ -213,29 +172,74 @@ async def translate_image(image_bytes: bytes, mime: str, target_lang: str) -> by
         },
     })
 
-    url = f'{MANGA_TRANSLATOR_URL.rstrip("/")}/translate/with-form/image/stream'
-    form = aiohttp.FormData()
-    form.add_field(
-        'image', image_bytes,
-        filename='page.png',
-        content_type=mime or 'image/png',
-    )
-    form.add_field('config', config_payload)
 
+async def _read_stream(resp: aiohttp.ClientResponse) -> bytes:
+    """
+    從 streaming endpoint 累積 chunk 直到拿到最終結果（status 0）或錯誤（status 2）。
+    chunk 格式：1 byte status | 4 byte big-endian size | N bytes data
+    其他 status（progress / queue pos / waiting）只用來印 log。
+    """
+    buffer = b''
+    async for chunk in resp.content.iter_any():
+        if not chunk:
+            continue
+        buffer += chunk
+        while len(buffer) >= 5:
+            status = buffer[0]
+            size = int.from_bytes(buffer[1:5], 'big')
+            if len(buffer) < 5 + size:
+                break  # 等下一個 chunk
+            payload = buffer[5:5 + size]
+            buffer = buffer[5 + size:]
+
+            if status == 0:
+                return payload  # 最終 PNG bytes
+            if status == 2:
+                raise RuntimeError(f'manga-translator worker error: {payload.decode("utf-8", errors="replace")[:300]}')
+            if status == 1:
+                try:
+                    print(f'[TRANSLATE]   進度: {payload.decode("utf-8", errors="replace")[:120]}')
+                except Exception:
+                    pass
+            elif status == 3:
+                print(f'[TRANSLATE]   排隊位置: {payload.decode("utf-8", errors="replace")}')
+            elif status == 4:
+                print('[TRANSLATE]   等待 worker 取件...')
+    raise RuntimeError('manga-translator stream 結束但未收到結果')
+
+
+async def translate_image(image_bytes: bytes, mime: str, target_lang: str) -> bytes:
+    """
+    把漫畫圖丟到 manga-image-translator server 翻譯，回傳翻譯後 PNG bytes。
+
+    走舊的 streaming endpoint /translate/with-form/image/stream，worker 端用 gpu_lock
+    在進程內讓 GPU 階段排隊、LLM 階段重疊。bot 側只要送 K 張並行（K = MANGA_TRANSLATOR_CONCURRENCY），
+    server 自己處理 overlap。
+
+    target_lang：接受 _LANG_CODE 內中文鍵名，未知預設 CHT。
+    """
+    image_bytes, mime, _ = await asyncio.to_thread(_maybe_downscale, image_bytes, mime)
+    code = _LANG_CODE.get(target_lang, 'CHT')
+    config_payload = _build_config_payload(code)
+    url = f'{MANGA_TRANSLATOR_URL.rstrip("/")}/translate/with-form/image/stream'
     size_kb = len(image_bytes) / 1024
-    # 排隊等 semaphore（上限 MANGA_TRANSLATOR_CONCURRENCY 個並發）
+
     queued_at = time.monotonic()
     if _WORKER_SEM.locked():
-        print(f'[TRANSLATE] 並發閘門滿，排隊中... ({size_kb:.0f}KB, {code})')
+        print(f'[TRANSLATE] in-flight 滿（上限 {MANGA_TRANSLATOR_CONCURRENCY}），排隊中... ({size_kb:.0f}KB, {code})')
     async with _WORKER_SEM:
         waited = time.monotonic() - queued_at
-        print(f'[TRANSLATE] 送出 → {url} ({size_kb:.0f}KB, {code}'
+        print(f'[TRANSLATE] 送出 ({size_kb:.0f}KB, {code}'
               f'{f", 等待 {waited:.1f}s" if waited > 1 else ""})')
         started = time.monotonic()
 
         async with aiohttp.ClientSession(timeout=_TIMEOUT) as session:
             for attempt in range(_WARMUP_RETRY_MAX):
                 try:
+                    form = aiohttp.FormData()
+                    form.add_field('image', image_bytes, filename='page.png',
+                                   content_type=mime or 'image/png')
+                    form.add_field('config', config_payload)
                     async with session.post(url, data=form) as resp:
                         if resp.status != 200:
                             body = await resp.text()
@@ -253,17 +257,10 @@ async def translate_image(image_bytes: bytes, mime: str, target_lang: str) -> by
                     raise RuntimeError(f'這張圖翻譯超過 {_PER_IMAGE_TIMEOUT} 秒，已跳過')
                 except RuntimeError as e:
                     msg = str(e).lower()
-                    if any(k in msg for k in _WARMUP_ERROR_KEYWORDS) and attempt < _WARMUP_RETRY_MAX - 1:
+                    if any(k in msg for k in ('starting up', 'no executor')) and attempt < _WARMUP_RETRY_MAX - 1:
                         print(f'[TRANSLATE] worker 暖機中，{_WARMUP_RETRY_DELAY:.0f}s 後重試 '
                               f'({attempt + 1}/{_WARMUP_RETRY_MAX})')
                         await asyncio.sleep(_WARMUP_RETRY_DELAY)
-                        # form 是 single-use，要重建
-                        form = aiohttp.FormData()
-                        form.add_field('image', image_bytes, filename='page.png',
-                                       content_type=mime or 'image/png')
-                        form.add_field('config', config_payload)
-                        started = time.monotonic()
                         continue
                     raise
-        # 不會到這裡，loop 內非 return 就 raise
         raise RuntimeError('translate_image: unreachable')

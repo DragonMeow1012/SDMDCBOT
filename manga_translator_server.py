@@ -29,9 +29,11 @@ from urllib.parse import urlparse
 from config import (
     MANGA_TRANSLATOR_AUTOSTART,
     MANGA_TRANSLATOR_BACKEND,
+    MANGA_TRANSLATOR_CONCURRENCY,
     MANGA_TRANSLATOR_DIR,
     MANGA_TRANSLATOR_FONT,
     MANGA_TRANSLATOR_GEMINI_MODEL,
+    MANGA_TRANSLATOR_NUM_WORKERS,
     MANGA_TRANSLATOR_OPENAI_API_BASE,
     MANGA_TRANSLATOR_OPENAI_MODEL,
     MANGA_TRANSLATOR_PYTHON,
@@ -214,6 +216,13 @@ def start() -> None:
         # 不蓋會直接 404；vision/text 用同一個 model（gemini-2.0-flash 都支援）
         child_env['GEMINI_MODEL'] = MANGA_TRANSLATOR_GEMINI_MODEL
         child_env['GEMINI_VISION_MODEL'] = MANGA_TRANSLATOR_GEMINI_MODEL
+    # 多 worker：N 個獨立進程各自載一份模型，VRAM ×N。orchestrator prepare() 會 spawn N 次。
+    child_env['MT_NUM_WORKERS'] = str(MANGA_TRANSLATOR_NUM_WORKERS)
+    # 每個 worker 內部允許多少並發 coroutine。
+    # K = MANGA_TRANSLATOR_CONCURRENCY（總 in-flight），分到每個 worker = K // N。
+    _per_worker = max(1, MANGA_TRANSLATOR_CONCURRENCY // max(1, MANGA_TRANSLATOR_NUM_WORKERS))
+    child_env['MT_WORKER_CONCURRENCY'] = str(_per_worker)
+
     # Windows 預設 console codepage cp950 寫日文/中文會變亂碼 → log 不可讀。
     # 強制 child Python 走 UTF-8（PYTHONUTF8 是 PEP 540 的 UTF-8 mode 開關）。
     child_env['PYTHONUTF8'] = '1'
